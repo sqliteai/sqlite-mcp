@@ -1,0 +1,68 @@
+{
+  "name": "@sqliteai/sqlite-mcp",
+  "version": "0.1.0",
+  "description": "SQLite MCP extension for Node.js - Model Context Protocol integration enabling SQLite databases to connect to MCP servers and call their tools.",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.mts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "prepublishOnly": "npm run build",
+    "test": "vitest",
+    "typecheck": "tsc --noEmit",
+    "generate-platforms": "node generate-platform-packages.js"
+  },
+  "keywords": [
+    "sqlite",
+    "mcp",
+    "ai",
+    "mcp-database",
+    "sqlite-extension"
+  ],
+  "author": "Gioele Cantoni (gioele@sqlitecloud.io)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sqliteai/sqlite-mcp.git",
+    "directory": "packages/node"
+  },
+  "homepage": "https://github.com/sqliteai/sqlite-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/sqliteai/sqlite-mcp/issues"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "optionalDependencies": {
+    "@sqliteai/sqlite-mcp-darwin-arm64": "0.1.0",
+    "@sqliteai/sqlite-mcp-darwin-x86_64": "0.1.0",
+    "@sqliteai/sqlite-mcp-linux-arm64": "0.1.0",
+    "@sqliteai/sqlite-mcp-linux-arm64-musl": "0.1.0",
+    "@sqliteai/sqlite-mcp-linux-x86_64": "0.1.0",
+    "@sqliteai/sqlite-mcp-linux-x86_64-musl": "0.1.0",
+    "@sqliteai/sqlite-mcp-win32-x86_64": "0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.3.0",
+    "vitest": "^3.2.4"
+  }
+}

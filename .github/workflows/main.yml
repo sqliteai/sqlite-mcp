@@ -1,0 +1,456 @@
+#
+#  main.yml
+#  sqlitemcp
+#
+#  Created by Gioele Cantoni on 05/11/25.
+#
+
+name: Build, Test and Release
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container && matrix.container || '' }}
+    name: ${{ matrix.name }}${{ matrix.arch && format('-{0}', matrix.arch) || '' }} build${{ matrix.arch != 'arm64-v8a' && matrix.arch != 'armeabi-v7a' && matrix.name != 'ios-sim' && matrix.name != 'ios' && matrix.name != 'apple-xcframework' && matrix.name != 'android-aar' && ( matrix.name != 'macos' || matrix.arch != 'x86_64' ) && ' + test' || ''}}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64
+          - os: ubuntu-22.04
+            arch: x86_64
+            name: linux
+
+          # Linux ARM64
+          - os: ubuntu-22.04-arm
+            arch: arm64
+            name: linux
+
+          # Linux musl x86_64
+          - os: ubuntu-22.04
+            arch: x86_64
+            name: linux-musl
+            container: alpine:latest
+
+          # Linux musl ARM64
+          - os: ubuntu-22.04-arm
+            arch: arm64
+            name: linux-musl
+
+          # macOS universal binary (x86_64 + arm64)
+          - os: macos-15
+            name: macos
+
+          # macOS x86_64 only
+          - os: macos-15
+            arch: x86_64
+            name: macos
+            make: ARCH=x86_64
+
+          # macOS ARM64 only
+          - os: macos-15
+            arch: arm64
+            name: macos
+            make: ARCH=arm64
+
+          # Windows x86_64
+          - os: windows-2022
+            arch: x86_64
+            name: windows
+
+          # Android ARM64-v8a
+          - os: ubuntu-22.04
+            arch: arm64-v8a
+            name: android
+            make: PLATFORM=android ARCH=arm64-v8a
+
+          # Android ARMv7
+          - os: ubuntu-22.04
+            arch: armeabi-v7a
+            name: android
+            make: PLATFORM=android ARCH=armeabi-v7a
+
+          # Android x86_64
+          - os: ubuntu-22.04
+            arch: x86_64
+            name: android
+            make: PLATFORM=android ARCH=x86_64
+            sqlite-amalgamation-zip: https://sqlite.org/2025/sqlite-amalgamation-3490100.zip
+
+          # iOS device
+          - os: macos-15
+            name: ios
+            make: PLATFORM=ios
+
+          # iOS simulator
+          - os: macos-15
+            name: ios-sim
+            make: PLATFORM=ios-sim
+
+          # Apple XCFramework
+          - os: macos-15
+            name: apple-xcframework
+            make: xcframework
+
+          # Android AAR
+          - os: ubuntu-22.04
+            name: android-aar
+            make: aar
+
+    defaults:
+      run:
+        shell: ${{ matrix.container && 'sh' || 'bash' }}
+
+    steps:
+
+      - uses: actions/checkout@v4.2.2
+        with:
+          submodules: recursive
+
+      - name: android setup java
+        if: matrix.name == 'android-aar'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: linux-musl x86_64 install dependencies
+        if: matrix.name == 'linux-musl' && matrix.arch == 'x86_64'
+        run: apk update && apk add --no-cache git gcc make sqlite musl-dev linux-headers rust cargo bash curl pkgconf openssl-dev nodejs npm
+
+      - name: linux-musl arm64 setup container
+        if: matrix.name == 'linux-musl' && matrix.arch == 'arm64'
+        run: |
+          docker run -d --name alpine \
+            --platform linux/arm64 \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            alpine:latest \
+            tail -f /dev/null
+          docker exec alpine sh -c "apk update && apk add --no-cache git gcc make sqlite musl-dev linux-headers rust cargo bash curl pkgconf openssl-dev nodejs npm"
+
+      - name: setup rust nightly
+        if: matrix.name != 'linux-musl'
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: windows install dependencies
+        if: matrix.name == 'windows'
+        run: choco install sqlite -y
+
+      - name: macos install dependencies
+        if: matrix.name == 'macos'
+        run: brew link sqlite --force
+
+      - name: build sqlite-mcp
+        run: ${{ matrix.name == 'linux-musl' && matrix.arch == 'arm64' && 'docker exec alpine' || '' }} make extension ${{ matrix.make && matrix.make || ''}}
+
+      - name: create keychain for codesign
+        if: matrix.os == 'macos-15'
+        run: |
+          echo "${{ secrets.APPLE_CERTIFICATE }}" | base64 --decode > certificate.p12
+          security create-keychain -p "${{ secrets.KEYCHAIN_PASSWORD }}" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "${{ secrets.KEYCHAIN_PASSWORD }}" build.keychain
+          security import certificate.p12 -k build.keychain -P "${{ secrets.CERTIFICATE_PASSWORD }}" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${{ secrets.KEYCHAIN_PASSWORD }}" build.keychain
+
+      - name: codesign and notarize dylib
+        if: matrix.os == 'macos-15' && matrix.name != 'apple-xcframework'
+        run: |
+          codesign --sign "${{ secrets.APPLE_TEAM_ID }}" --timestamp --options runtime dist/mcp.dylib
+          ditto -c -k dist/mcp.dylib dist/mcp.zip
+          xcrun notarytool submit dist/mcp.zip --apple-id "${{ secrets.APPLE_ID }}" --password "${{ secrets.APPLE_PASSWORD }}" --team-id "${{ secrets.APPLE_TEAM_ID }}" --wait
+          rm dist/mcp.zip
+
+      - name: codesign and notarize xcframework
+        if: matrix.name == 'apple-xcframework'
+        run: |
+          find dist/mcp.xcframework -name "*.framework" -exec echo "Signing: {}" \; -exec codesign --sign "${{ secrets.APPLE_TEAM_ID }}" --timestamp --options runtime {} \;
+          codesign --sign "${{ secrets.APPLE_TEAM_ID }}" --timestamp --options runtime dist/mcp.xcframework
+          ditto -c -k --keepParent dist/mcp.xcframework dist/mcp.xcframework.zip
+          xcrun notarytool submit dist/mcp.xcframework.zip --apple-id "${{ secrets.APPLE_ID }}" --password "${{ secrets.APPLE_PASSWORD }}" --team-id "${{ secrets.APPLE_TEAM_ID }}" --wait
+          rm dist/mcp.xcframework.zip
+
+      - name: cleanup keychain for codesign
+        if: matrix.os == 'macos-15'
+        run: |
+          rm certificate.p12
+          security delete-keychain build.keychain
+
+      - name: android setup test environment
+        if: matrix.name == 'android' && matrix.arch != 'arm64-v8a' && matrix.arch != 'armeabi-v7a'
+        run: |
+
+          echo "::group::enable kvm group perms"
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          echo "::endgroup::"
+
+          echo "::group::download and build sqlite3 without SQLITE_OMIT_LOAD_EXTENSION"
+          curl -O ${{ matrix.sqlite-amalgamation-zip }}
+          unzip sqlite-amalgamation-*.zip
+          export ${{ matrix.make }}
+          $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.arch }}-linux-android26-clang sqlite-amalgamation-*/shell.c sqlite-amalgamation-*/sqlite3.c -o sqlite3 -ldl
+          # remove unused folders to save up space
+          rm -rf sqlite-amalgamation-*.zip sqlite-amalgamation-*
+          echo "::endgroup::"
+
+          echo "::group::prepare the test script"
+          make test PLATFORM=$PLATFORM ARCH=$ARCH || echo "It should fail. Running remaining commands in the emulator"
+          cat > commands.sh << EOF
+            mv -f /data/local/tmp/sqlite3 /system/xbin
+            cd /data/local/tmp
+            $(make test PLATFORM=$PLATFORM ARCH=$ARCH -n)
+          EOF
+          echo "::endgroup::"
+
+      - name: android test sqlite-mcp
+        if: matrix.name == 'android' && matrix.arch != 'arm64-v8a' && matrix.arch != 'armeabi-v7a'
+        uses: reactivecircus/android-emulator-runner@v2.34.0
+        with:
+          api-level: 26
+          arch: ${{ matrix.arch }}
+          script: |
+            adb root
+            adb remount
+            adb push ${{ github.workspace }}/. /data/local/tmp/
+            adb shell "sh /data/local/tmp/commands.sh"
+
+      - name: test sqlite-mcp
+        if: contains(matrix.name, 'linux') || matrix.name == 'windows' || ( matrix.name == 'macos' && matrix.arch != 'x86_64' )
+        run: |
+          ${{ matrix.name == 'linux-musl' && matrix.arch == 'x86_64' && 'npx playwright install chrome &&' || '' }} \
+          ${{ matrix.name == 'linux-musl' && matrix.arch == 'arm64' && 'docker exec alpine' || '' }} \
+          npx @playwright/mcp@latest --port 8931 --headless & \
+          sleep 3 && \
+          make test ${{ matrix.make && matrix.make || ''}}
+
+      - uses: actions/upload-artifact@v4.6.2
+        if: always()
+        with:
+          name: mcp-${{ matrix.name }}${{ matrix.arch && format('-{0}', matrix.arch) || '' }}
+          path: dist/mcp.*
+          if-no-files-found: error
+
+  release:
+    runs-on: ubuntu-22.04
+    name: release
+    needs: build
+    if: github.ref == 'refs/heads/main'
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+
+      - uses: actions/checkout@v4.2.2
+
+      - uses: actions/download-artifact@v4.2.1
+        with:
+          path: artifacts
+
+      - name: zip artifacts
+        run: |
+          VERSION=$(make version)
+          for folder in "artifacts"/*; do
+            if [ -d "$folder" ]; then
+              name=$(basename "$folder")
+              if [[ "$name" != "mcp-apple-xcframework" && "$name" != "mcp-android-aar" ]]; then
+                tar -czf "${name}-${VERSION}.tar.gz" -C "$folder" .
+              fi
+              if [[ "$name" != "mcp-android-aar" ]]; then
+                (cd "$folder" && zip -rq "../../${name}-${VERSION}.zip" .)
+              else
+                cp "$folder"/*.aar "${name}-${VERSION}.aar"
+              fi
+            fi
+          done
+
+      - name: release tag version from sqlite-mcp.h
+        id: tag
+        run: |
+          VERSION=$(make version)
+          if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            LATEST_RELEASE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/releases/latest)
+            LATEST=$(echo "$LATEST_RELEASE" | jq -r '.name')
+
+            # Check artifact sizes against previous release
+            if [ -n "$LATEST" ] && [ "$LATEST" != "null" ]; then
+              echo "Checking artifact sizes against previous release: $LATEST"
+              FAILED=0
+
+              for artifact in mcp-*-${VERSION}.*; do
+                if [ ! -f "$artifact" ]; then
+                  continue
+                fi
+
+                # Get current artifact size
+                NEW_SIZE=$(stat -c%s "$artifact" 2>/dev/null || stat -f%z "$artifact")
+
+                # Get artifact name for previous release
+                ARTIFACT_NAME=$(echo "$artifact" | sed "s/${VERSION}/${LATEST}/")
+
+                # Get previous artifact size from GitHub API
+                OLD_SIZE=$(echo "$LATEST_RELEASE" | jq -r ".assets[] | select(.name == \"$(basename "$ARTIFACT_NAME")\") | .size")
+
+                if [ -z "$OLD_SIZE" ] || [ "$OLD_SIZE" = "null" ]; then
+                  echo "⚠️  Previous artifact not found: $(basename "$ARTIFACT_NAME"), skipping comparison"
+                  continue
+                fi
+
+                # Calculate percentage increase
+                INCREASE=$(awk "BEGIN {printf \"%.2f\", (($NEW_SIZE - $OLD_SIZE) / $OLD_SIZE) * 100}")
+
+                echo "📦 $artifact: $OLD_SIZE → $NEW_SIZE bytes (${INCREASE}% change)"
+
+                # Check if increase is more than 5%
+                if (( $(echo "$INCREASE > 5" | bc -l) )); then
+                  if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+                    echo "⚠️  WARNING: $artifact size increased by ${INCREASE}% (limit: 5%)"
+                  else
+                    echo "❌ ERROR: $artifact size increased by ${INCREASE}% (limit: 5%)"
+                    FAILED=1
+                  fi
+                fi
+              done
+
+              if [ $FAILED -eq 1 ]; then
+                echo ""
+                echo "❌ One or more artifacts exceeded the 5% size increase limit"
+                exit 1
+              fi
+
+              echo "✅ All artifacts within 5% size increase limit"
+            fi
+
+            if [[ "$VERSION" != "$LATEST" || "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+              echo "version=$VERSION" >> $GITHUB_OUTPUT
+            else
+              echo "::warning file=src/sqlite-mcp.h::To release a new version, please update the SQLITE_MCP_VERSION in src/sqlite-mcp.h to be different than the latest $LATEST"
+            fi
+            exit 0
+          fi
+          echo "❌ SQLITE_MCP_VERSION not found in sqlite-mcp.h"
+          exit 1
+
+      - uses: actions/setup-java@v4
+        if: steps.tag.outputs.version != ''
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: release android aar to maven central
+        if: steps.tag.outputs.version != ''
+        run: cd packages/android && ./gradlew publishAggregationToCentralPortal -PSIGNING_KEY="${{ secrets.SIGNING_KEY }}" -PSIGNING_PASSWORD="${{ secrets.SIGNING_PASSWORD }}" -PSONATYPE_USERNAME="${{ secrets.MAVEN_CENTRAL_USERNAME }}" -PSONATYPE_PASSWORD="${{ secrets.MAVEN_CENTRAL_TOKEN }}" -PVERSION="${{ steps.tag.outputs.version }}" -PAAR_PATH="../../artifacts/mcp-android-aar/mcp.aar"
+
+      - uses: actions/setup-node@v4
+        if: steps.tag.outputs.version != ''
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: update npm
+        run: npm install -g npm@11.5.1
+
+      - name: build and publish npm packages
+        if: steps.tag.outputs.version != ''
+        run: |
+          cd packages/node
+
+          # Update version in package.json
+          echo "Updating versions to ${{ steps.tag.outputs.version }}..."
+
+          # Update package.json
+          jq --arg version "${{ steps.tag.outputs.version }}" \
+            '.version = $version | .optionalDependencies = (.optionalDependencies | with_entries(.value = $version))' \
+            package.json > package.tmp.json && mv package.tmp.json package.json
+
+          echo "✓ Updated package.json to version ${{ steps.tag.outputs.version }}"
+
+          # Generate platform packages
+          echo "Generating platform packages..."
+          node generate-platform-packages.js "${{ steps.tag.outputs.version }}" "../../artifacts" "./platform-packages"
+          echo "✓ Generated platform packages"
+          ls -la platform-packages/
+
+          # Build main package
+          echo "Building main package..."
+          npm install
+          npm run build
+          npm test
+          echo "✓ Main package built and tested"
+
+          # Publish platform packages
+          echo "Publishing platform packages to npm..."
+          cd platform-packages
+          for platform_dir in */; do
+            platform_name=$(basename "$platform_dir")
+            echo "  Publishing @sqliteai/sqlite-mcp-${platform_name}..."
+            cd "$platform_dir"
+            npm publish --provenance --access public
+            cd ..
+            echo "  ✓ Published @sqliteai/sqlite-mcp-${platform_name}"
+          done
+          cd ..
+
+          # Publish main package
+          echo "Publishing main package to npm..."
+          npm publish --provenance --access public
+          echo "✓ Published @sqliteai/sqlite-mcp@${{ steps.tag.outputs.version }}"
+
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ Successfully published packages to npm"
+          echo "   Main: @sqliteai/sqlite-mcp@${{ steps.tag.outputs.version }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+      - uses: softprops/action-gh-release@v2.2.1
+        if: steps.tag.outputs.version != ''
+        with:
+          body: |
+            # SQLite MCP Client Extension v${{ steps.tag.outputs.version }}
+
+            ## Packages
+
+            [**Node**](https://www.npmjs.com/package/@sqliteai/sqlite-mcp): `npm install @sqliteai/sqlite-mcp`
+            [**Android**](https://central.sonatype.com/artifact/ai.sqlite/mcp): `ai.sqlite:mcp:${{ steps.tag.outputs.version }}`
+            [**Swift**](https://github.com/sqliteai/sqlite-mcp#swift-package): [Installation Guide](https://github.com/sqliteai/sqlite-mcp#swift-package)
+
+            ## Installation
+
+            **macOS:**
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.version }}/mcp-macos-${{ steps.tag.outputs.version }}.tar.gz
+            tar -xzf mcp-macos-${{ steps.tag.outputs.version }}.tar.gz
+            sqlite3 :memory: ".load ./mcp.dylib" "SELECT mcp_version();"
+            ```
+
+            **Linux:**
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.version }}/mcp-linux-x86_64-${{ steps.tag.outputs.version }}.tar.gz
+            tar -xzf mcp-linux-x86_64-${{ steps.tag.outputs.version }}.tar.gz
+            sqlite3 :memory: ".load ./mcp.so" "SELECT mcp_version();"
+            ```
+
+            **Windows:**
+            ```powershell
+            Invoke-WebRequest -Uri "https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.version }}/mcp-windows-x86_64-${{ steps.tag.outputs.version }}.zip" -OutFile "mcp.zip"
+            Expand-Archive -Path "mcp.zip" -DestinationPath "."
+            sqlite3 :memory: ".load ./mcp.dll" "SELECT mcp_version();"
+            ```
+
+            ---
+
+          generate_release_notes: true
+          tag_name: ${{ steps.tag.outputs.version }}
+          files: mcp-*-${{ steps.tag.outputs.version }}.*
+          make_latest: true

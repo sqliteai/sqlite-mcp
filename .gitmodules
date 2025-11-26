@@ -1,0 +1,3 @@
+[submodule "modules/mcp"]
+	path = modules/mcp
+	url = https://github.com/modelcontextprotocol/rust-sdk

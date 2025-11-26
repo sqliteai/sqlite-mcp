@@ -1,0 +1,121 @@
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.5.2'
+    }
+}
+
+plugins {
+    id 'com.gradleup.nmcp.aggregation' version '1.2.0'
+}
+
+apply plugin: 'com.android.library'
+apply plugin: 'maven-publish'
+apply plugin: 'signing'
+
+android {
+    namespace 'ai.sqlite.mcp'
+    compileSdk 34
+
+    defaultConfig {
+        minSdk 26
+        targetSdk 34
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+}
+
+repositories {
+    google()
+    mavenCentral()
+    maven { url 'https://jitpack.io' }
+}
+
+dependencies {
+}
+
+afterEvaluate {
+    publishing {
+        publications {
+            release(MavenPublication) {
+                groupId = 'ai.sqlite'
+                artifactId = 'mcp'
+                version = project.hasProperty('VERSION') ? project.VERSION : ['make', 'version'].execute(null, file('../..')).text.trim()
+
+                artifact(project.hasProperty('AAR_PATH') ? project.AAR_PATH : "$buildDir/outputs/aar/android-release.aar")
+
+                // Maven Central metadata
+                pom {
+                    name = 'sqlite-mcp'
+                    description = 'A SQLite extension that integrates the Model Context Protocol (MCP), enabling SQLite databases to connect to MCP servers and call their tools.'
+                    url = 'https://github.com/sqliteai/sqlite-mcp'
+
+                    licenses {
+                        license {
+                            name = 'MIT License'
+                            url = 'https://github.com/sqliteai/sqlite-mcp/blob/main/LICENSE'
+                        }
+                    }
+
+                    developers {
+                        developer {
+                            id = 'sqliteai'
+                            name = 'SQLite Cloud, Inc.'
+                            email = 'info@sqlitecloud.io'
+                            organization = 'SQLite Cloud, Inc.'
+                            organizationUrl = 'https://sqlite.ai'
+                        }
+                    }
+
+                    scm {
+                        connection = 'scm:git:git://github.com/sqliteai/sqlite-mcp.git'
+                        developerConnection = 'scm:git:ssh://github.com:sqliteai/sqlite-mcp.git'
+                        url = 'https://github.com/sqliteai/sqlite-mcp/tree/main'
+                    }
+                }
+            }
+        }
+    }
+
+    // Signing configuration for Maven Central
+    signing {
+        required { project.hasProperty("SIGNING_KEY") }
+        if (project.hasProperty("SIGNING_KEY")) {
+            useInMemoryPgpKeys(
+                project.property("SIGNING_KEY").toString(),
+                project.property("SIGNING_PASSWORD").toString()
+            )
+            sign publishing.publications.release
+        }
+    }
+}
+
+// Maven Central publishing via NMCP aggregation
+nmcpAggregation {
+    if (project.hasProperty("SONATYPE_USERNAME") && project.hasProperty("SONATYPE_PASSWORD")) {
+        centralPortal {
+            username = project.property("SONATYPE_USERNAME")
+            password = project.property("SONATYPE_PASSWORD")
+            publishingType = "AUTOMATIC"
+        }
+        publishAllProjectsProbablyBreakingProjectIsolation()
+    }
+}
