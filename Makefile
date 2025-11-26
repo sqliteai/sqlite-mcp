@@ -85,6 +85,7 @@ else ifeq ($(PLATFORM),android)
 		$(error "Android NDK must be set")
 	endif
 	BIN = $(ANDROID_NDK)/toolchains/llvm/prebuilt/$(HOST)-x86_64/bin
+	PATH := $(BIN):$(PATH)
 	ifneq (,$(filter $(ARCH),arm64 arm64-v8a))
 		override ARCH := aarch64
 		ANDROID_ABI := android26
@@ -137,15 +138,17 @@ endif
 $(shell mkdir -p $(BUILD_DIR) $(DIST_DIR))
 all: extension
 
-$(OPENSSL):
+OPENSSL_SRC = $(BUILD_DIR)/openssl
+$(OPENSSL_SRC):
 	git clone https://github.com/openssl/openssl.git $(BUILD_DIR)/openssl
 
+$(OPENSSL): $(OPENSSL_SRC)
 	cd $(BUILD_DIR)/openssl && \
 	./Configure android-$(if $(filter aarch64,$(ARCH)),arm64,$(if $(filter armv7a,$(ARCH)),arm,$(ARCH))) \
 		--prefix=$(BIN)/../sysroot/usr \
 		no-shared no-unit-test \
 		-D__ANDROID_API__=26 && \
-	$(MAKE) && $(MAKE) install_sw
+	$(MAKE) clean && $(MAKE) && $(MAKE) install_sw
 
 # Build the Rust FFI static library
 ifeq ($(PLATFORM),android)
@@ -308,12 +311,17 @@ xcframework: $(DIST_DIR)/mcp.xcframework
 AAR_ARM64 = packages/android/src/main/jniLibs/arm64-v8a/
 AAR_ARM = packages/android/src/main/jniLibs/armeabi-v7a/
 AAR_X86 = packages/android/src/main/jniLibs/x86_64/
+AAR_USR = $(ANDROID_NDK)/toolchains/llvm/prebuilt/$(HOST)-x86_64/sysroot/usr/
+AAR_CLEAN = rm -rf $(CURL_DIR)/android $(AAR_USR)bin/openssl $(AAR_USR)include/openssl $(AAR_USR)lib/libssl.a $(AAR_USR)lib/libcrypto.a $(AAR_USR)lib/ossl-modules
 aar:
 	mkdir -p $(AAR_ARM64) $(AAR_ARM) $(AAR_X86)
+	$(AAR_CLEAN)
 	$(MAKE) clean && $(MAKE) PLATFORM=android ARCH=arm64-v8a
 	mv $(DIST_DIR)/mcp.so $(AAR_ARM64)
+	$(AAR_CLEAN)
 	$(MAKE) clean && $(MAKE) PLATFORM=android ARCH=armeabi-v7a
 	mv $(DIST_DIR)/mcp.so $(AAR_ARM)
+	$(AAR_CLEAN)
 	$(MAKE) clean && $(MAKE) PLATFORM=android ARCH=x86_64
 	mv $(DIST_DIR)/mcp.so $(AAR_X86)
 	cd packages/android && ./gradlew clean assembleRelease
