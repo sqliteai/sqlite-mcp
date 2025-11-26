@@ -111,6 +111,10 @@ jobs:
 
     steps:
 
+      - name: linux-musl x86_64 install dependencies
+        if: contains(matrix.name, 'linux-musl') && matrix.arch == 'x86_64'
+        run: apk update && apk add --no-cache git gcc make sqlite musl-dev linux-headers rust cargo bash curl pkgconf openssl-dev nodejs npm
+
       - uses: actions/checkout@v4.2.2
         with:
           submodules: recursive
@@ -121,10 +125,6 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
-
-      - name: linux-musl x86_64 install dependencies
-        if: matrix.name == 'linux-musl' && matrix.arch == 'x86_64'
-        run: apk update && apk add --no-cache git gcc make sqlite musl-dev linux-headers rust cargo bash curl pkgconf openssl-dev nodejs npm
 
       - name: linux-musl arm64 setup container
         if: matrix.name == 'linux-musl' && matrix.arch == 'arm64'
