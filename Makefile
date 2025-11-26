@@ -95,6 +95,7 @@ else ifeq ($(PLATFORM),android)
 		ANDROID_ABI := android26
 	endif
 	CC = $(BIN)/$(ARCH)-linux-$(ANDROID_ABI)-clang
+	OPENSSL := $(BIN)/../sysroot/usr/include/openssl
 	TARGET := $(DIST_DIR)/mcp.so
 	LDFLAGS += -shared
 	STRIP = $(BIN)/llvm-strip --strip-unneeded $@
@@ -136,8 +137,22 @@ endif
 $(shell mkdir -p $(BUILD_DIR) $(DIST_DIR))
 all: extension
 
+$(OPENSSL):
+	git clone https://github.com/openssl/openssl.git $(BUILD_DIR)/openssl
+
+	cd $(BUILD_DIR)/openssl && \
+	./Configure android-$(if $(filter aarch64,$(ARCH)),arm64,$(if $(filter armv7a,$(ARCH)),arm,$(ARCH))) \
+		--prefix=$(BIN)/../sysroot/usr \
+		no-shared no-unit-test \
+		-D__ANDROID_API__=26 && \
+	$(MAKE) && $(MAKE) install_sw
+
 # Build the Rust FFI static library
+ifeq ($(PLATFORM),android)
+staticlib: $(OPENSSL)
+else
 staticlib:
+endif
 ifeq ($(PLATFORM),macos)
   ifndef ARCH
 	@echo "Checking Rust targets for macOS universal build..."
