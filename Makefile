@@ -33,7 +33,7 @@ MAKEFLAGS += -j$(CPUS)
 # Compiler and flags
 CC = gcc
 CARGO_ENV = CARGO_TARGET_DIR=$(RUST_TARGET_DIR)
-CARGO = $(CARGO_ENV) cargo +nightly
+CARGO = $(CARGO_ENV) cargo
 CFLAGS = -Wall -Wextra -Wno-unused-parameter -I$(SRC_DIR) -I$(LIBS_DIR)
 
 # Directories
@@ -73,7 +73,7 @@ else ifeq ($(PLATFORM),macos)
 	LDFLAGS += -dynamiclib -undefined dynamic_lookup -headerpad_max_install_names -mmacosx-version-min=$(MACOS_MIN_VERSION)
 	CFLAGS += -mmacosx-version-min=$(MACOS_MIN_VERSION)
 	CARGO_ENV += MACOSX_DEPLOYMENT_TARGET=$(MACOS_MIN_VERSION)
-	CARGO = $(CARGO_ENV) cargo +nightly
+	CARGO = $(CARGO_ENV) cargo
 	STRIP = strip -x -S $@
 	LIBS = -lmcp_ffi -framework CoreFoundation -framework Security -lresolv
 	TEST_LIBS = -lpthread -ldl -lm

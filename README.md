@@ -52,7 +52,7 @@ See [API.md](API.md) for complete API documentation with examples.
 
 ### Requirements
 
-- **Rust**: Nightly toolchain (`rustup default nightly`)
+- **Rust**: 1.85+ toolchain
 - **C Compiler**: gcc or clang
 - **Make**: GNU Make
 
