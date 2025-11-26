@@ -87,8 +87,14 @@ else ifeq ($(PLATFORM),android)
 	BIN = $(ANDROID_NDK)/toolchains/llvm/prebuilt/$(HOST)-x86_64/bin
 	ifneq (,$(filter $(ARCH),arm64 arm64-v8a))
 		override ARCH := aarch64
+		ANDROID_ABI := android26
+	else ifeq ($(ARCH),armeabi-v7a)
+		override ARCH := armv7a
+		ANDROID_ABI := androideabi26
+	else
+		ANDROID_ABI := android26
 	endif
-	CC = $(BIN)/$(ARCH)-linux-android26-clang
+	CC = $(BIN)/$(ARCH)-linux-$(ANDROID_ABI)-clang
 	TARGET := $(DIST_DIR)/mcp.so
 	LDFLAGS += -shared
 	STRIP = $(BIN)/llvm-strip --strip-unneeded $@
