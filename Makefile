@@ -33,6 +33,9 @@ MAKEFLAGS += -j$(CPUS)
 # Compiler and flags
 CC = gcc
 CARGO_ENV = CARGO_TARGET_DIR=$(RUST_TARGET_DIR)
+ifeq ($(PLATFORM),android)
+	CARGO_ENV += OPENSSL_DIR=$(BIN)/../sysroot/usr
+endif
 CARGO = $(CARGO_ENV) cargo
 CFLAGS = -Wall -Wextra -Wno-unused-parameter -I$(SRC_DIR) -I$(LIBS_DIR)
 
