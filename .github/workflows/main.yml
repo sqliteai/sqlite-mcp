@@ -202,11 +202,6 @@ jobs:
 
           echo "::group::prepare the test script"
           make test PLATFORM=$PLATFORM ARCH=$ARCH || echo "It should fail. Running remaining commands in the emulator"
-          cat > commands.sh << EOF
-            mv -f /data/local/tmp/sqlite3 /system/xbin
-            cd /data/local/tmp
-            $(make test PLATFORM=$PLATFORM ARCH=$ARCH -n)
-          EOF
           rm -rf build # free space for the emulator
           echo "::endgroup::"
 
@@ -220,7 +215,9 @@ jobs:
             adb root
             adb remount
             adb push ${{ github.workspace }}/. /data/local/tmp/
-            adb shell "sh /data/local/tmp/commands.sh"
+            adb shell "mv -f /data/local/tmp/sqlite3 /system/xbin"
+            npx @playwright/mcp@latest --port 8931 --headless & sleep 3 && \
+            adb shell "cd /data/local/tmp && sqlite3 \":memory:\" -cmd \".bail on\" \".load ./dist/mcp\" \"SELECT mcp_version();\" && ./build/test"
 
       - name: linux-musl x86_64 test sqlite-mcp
         if: matrix.name == 'linux-musl' && matrix.arch == 'x86_64'
