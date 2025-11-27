@@ -207,6 +207,7 @@ jobs:
             cd /data/local/tmp
             $(make test PLATFORM=$PLATFORM ARCH=$ARCH -n)
           EOF
+          rm -rf build # free space for the emulator
           echo "::endgroup::"
 
       - name: android test sqlite-mcp

@@ -145,11 +145,10 @@ all: extension
 OPENSSL_SRC = $(BUILD_DIR)/openssl
 OPENSSL_TARBALL = $(BUILD_DIR)/openssl-3.6.0.tar.gz
 $(OPENSSL_TARBALL):
-	@mkdir -p $(BUILD_DIR)
 	curl -L -o $(OPENSSL_TARBALL) https://github.com/openssl/openssl/releases/download/openssl-3.6.0/openssl-3.6.0.tar.gz
 
 $(OPENSSL_SRC): $(OPENSSL_TARBALL)
-	tar -xzf $(OPENSSL_TARBALL) -C $(BUILD_DIR)
+	tar -xzf $(OPENSSL_TARBALL) -C $(BUILD_DIR); \
 	mv $(BUILD_DIR)/openssl-3.6.0 $(OPENSSL_SRC)
 
 $(OPENSSL): $(OPENSSL_SRC)
@@ -223,10 +222,10 @@ else ifeq ($(PLATFORM),android)
 	$(CARGO) build --release --target aarch64-linux-android
 	@mkdir -p $(RUST_TARGET_DIR)/release
 	cp $(RUST_TARGET_DIR)/aarch64-linux-android/release/libmcp_ffi.a $(RUST_TARGET_DIR)/release/libmcp_ffi.a
-  else ifeq ($(ARCH),armv7)
+  else ifeq ($(ARCH),armv7a)
 	@echo "Checking Rust target for Android ARMv7..."
 	@rustup target list | grep -q "armv7-linux-androideabi (installed)" || rustup target add armv7-linux-androideabi
-	$(CARGO) build --release --target armv7-linux-androideabi
+	CC=$(CC) AR=$(BIN)/llvm-ar $(CARGO) build --release --target armv7-linux-androideabi
 	@mkdir -p $(RUST_TARGET_DIR)/release
 	cp $(RUST_TARGET_DIR)/armv7-linux-androideabi/release/libmcp_ffi.a $(RUST_TARGET_DIR)/release/libmcp_ffi.a
   else ifeq ($(ARCH),x86_64)
@@ -351,6 +350,7 @@ help:
 	@echo "  staticlib  - Build only the Rust static library"
 	@echo "  test       - Run quick CLI test + C test suite"
 	@echo "  xcframework- Build XCFramework for Swift Package Manager (macOS/iOS)"
+	@echo "  aar        - Build Android AAR package (requires ANDROID_NDK)"
 	@echo "  clean      - Remove all build artifacts"
 	@echo "  version    - Display extension version"
 	@echo "  help       - Display this help message"
@@ -368,4 +368,4 @@ help:
 	@echo "  make test                      # Build and test"
 	@echo "  make PLATFORM=android ARCH=arm64-v8a  # Build for Android ARM64"
 
-.PHONY: all extension staticlib test xcframework clean version help
+.PHONY: all extension staticlib test xcframework aar clean version help
