@@ -102,9 +102,10 @@ else ifeq ($(PLATFORM),android)
 	OPENSSL := $(BIN)/../sysroot/usr/include/openssl
 	TARGET := $(DIST_DIR)/mcp.so
 	LDFLAGS += -shared
+	CFLAGS += -fPIC
 	STRIP = $(BIN)/llvm-strip --strip-unneeded $@
-	LIBS = -lmcp_ffi -lpthread -ldl -lm -lssl -lcrypto
-	TEST_LIBS = -lpthread -ldl -lm
+	LIBS = -lmcp_ffi -ldl -lm -lssl -lcrypto
+	TEST_LIBS = -ldl -lm
 else ifeq ($(PLATFORM),ios)
 	TARGET := $(DIST_DIR)/mcp.dylib
 	SDK := -isysroot $(shell xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=11.0
@@ -142,8 +143,14 @@ $(shell mkdir -p $(BUILD_DIR) $(DIST_DIR))
 all: extension
 
 OPENSSL_SRC = $(BUILD_DIR)/openssl
-$(OPENSSL_SRC):
-	git clone https://github.com/openssl/openssl.git $(BUILD_DIR)/openssl
+OPENSSL_TARBALL = $(BUILD_DIR)/openssl-3.6.0.tar.gz
+$(OPENSSL_TARBALL):
+	@mkdir -p $(BUILD_DIR)
+	curl -L -o $(OPENSSL_TARBALL) https://github.com/openssl/openssl/releases/download/openssl-3.6.0/openssl-3.6.0.tar.gz
+
+$(OPENSSL_SRC): $(OPENSSL_TARBALL)
+	tar -xzf $(OPENSSL_TARBALL) -C $(BUILD_DIR)
+	mv $(BUILD_DIR)/openssl-3.6.0 $(OPENSSL_SRC)
 
 $(OPENSSL): $(OPENSSL_SRC)
 	cd $(BUILD_DIR)/openssl && \
@@ -315,7 +322,7 @@ AAR_ARM64 = packages/android/src/main/jniLibs/arm64-v8a/
 AAR_ARM = packages/android/src/main/jniLibs/armeabi-v7a/
 AAR_X86 = packages/android/src/main/jniLibs/x86_64/
 AAR_USR = $(ANDROID_NDK)/toolchains/llvm/prebuilt/$(HOST)-x86_64/sysroot/usr/
-AAR_CLEAN = rm -rf $(CURL_DIR)/android $(AAR_USR)bin/openssl $(AAR_USR)include/openssl $(AAR_USR)lib/libssl.a $(AAR_USR)lib/libcrypto.a $(AAR_USR)lib/ossl-modules
+AAR_CLEAN = rm -rf $(AAR_USR)bin/openssl $(AAR_USR)include/openssl $(AAR_USR)lib/libssl.a $(AAR_USR)lib/libcrypto.a $(AAR_USR)lib/ossl-modules
 aar:
 	mkdir -p $(AAR_ARM64) $(AAR_ARM) $(AAR_X86)
 	$(AAR_CLEAN)
