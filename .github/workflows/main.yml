@@ -221,10 +221,13 @@ jobs:
             adb push ${{ github.workspace }}/. /data/local/tmp/
             adb shell "sh /data/local/tmp/commands.sh"
 
+      - name: linux-musl x86_64 test sqlite-mcp
+        if: matrix.name == 'linux-musl' && matrix.arch == 'x86_64'
+        run: sqlite3 ":memory:" -cmd ".bail on" ".load ./dist/mcp" "SELECT mcp_version();"
+
       - name: test sqlite-mcp
-        if: contains(matrix.name, 'linux') || matrix.name == 'windows' || ( matrix.name == 'macos' && matrix.arch != 'x86_64' )
+        if: matrix.name == 'linux' || ( matrix.name == 'linux-musl' && matrix.arch == 'arm64' ) || matrix.name == 'windows' || ( matrix.name == 'macos' && matrix.arch != 'x86_64' )
         run: |
-          ${{ matrix.name == 'linux-musl' && matrix.arch == 'x86_64' && 'npx playwright install chrome &&' || '' }} \
           ${{ matrix.name == 'linux-musl' && matrix.arch == 'arm64' && 'docker exec alpine' || '' }} \
           npx @playwright/mcp@latest --port 8931 --headless & \
           sleep 3 && \
