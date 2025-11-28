@@ -217,7 +217,7 @@ jobs:
             adb remount
             adb push ${{ github.workspace }}/. /data/local/tmp/
             adb shell "mv -f /data/local/tmp/sqlite3 /system/xbin"
-            npx @playwright/mcp@latest --port 8931 --headless & sleep 3
+            npx @playwright/mcp@latest --port 8931 --headless & sleep 20
             adb reverse tcp:8931 tcp:8931
             adb shell "cd /data/local/tmp && sqlite3 \":memory:\" -cmd \".bail on\" \".load ./dist/mcp\" \"SELECT mcp_version();\" && ./android-test"
 
