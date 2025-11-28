@@ -206,6 +206,12 @@ jobs:
           rm -rf build # free space for the emulator
           echo "::endgroup::"
 
+      - name: run mcp test server
+        if: ( matrix.name == 'android' && matrix.arch == 'x86_64' ) || matrix.name == 'linux' || ( matrix.name == 'linux-musl' && matrix.arch == 'arm64' ) || matrix.name == 'windows' || ( matrix.name == 'macos' && matrix.arch != 'x86_64' )
+        run: |
+          ${{ matrix.name == 'linux-musl' && matrix.arch == 'arm64' && 'docker exec alpine' || '' }} \
+          npx @playwright/mcp@latest --port 8931 --headless & sleep 10
+
       - name: android test sqlite-mcp
         if: matrix.name == 'android' && matrix.arch != 'arm64-v8a' && matrix.arch != 'armeabi-v7a'
         uses: reactivecircus/android-emulator-runner@v2.34.0
@@ -213,14 +219,12 @@ jobs:
           api-level: 26
           arch: ${{ matrix.arch }}
           script: |
-            npx @playwright/mcp@latest --port 8931 --headless & sleep 10
             adb root
             adb remount
             adb push ${{ github.workspace }}/. /data/local/tmp/
             adb shell "mv -f /data/local/tmp/sqlite3 /system/xbin"
             adb reverse tcp:8931 tcp:8931
             adb shell "cd /data/local/tmp && sqlite3 \":memory:\" -cmd \".bail on\" \".load ./dist/mcp\" \"SELECT mcp_version();\" && ./android-test"
-            exit 0
 
       - name: linux-musl x86_64 test sqlite-mcp
         if: matrix.name == 'linux-musl' && matrix.arch == 'x86_64'
@@ -228,11 +232,7 @@ jobs:
 
       - name: test sqlite-mcp
         if: matrix.name == 'linux' || ( matrix.name == 'linux-musl' && matrix.arch == 'arm64' ) || matrix.name == 'windows' || ( matrix.name == 'macos' && matrix.arch != 'x86_64' )
-        run: |
-          ${{ matrix.name == 'linux-musl' && matrix.arch == 'arm64' && 'docker exec alpine' || '' }} \
-          npx @playwright/mcp@latest --port 8931 --headless & \
-          sleep 3 && \
-          make test ${{ matrix.make && matrix.make || ''}}
+        run: make test ${{ matrix.make && matrix.make || ''}}
 
       - uses: actions/upload-artifact@v4.6.2
         if: always()
