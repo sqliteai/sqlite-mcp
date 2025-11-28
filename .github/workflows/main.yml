@@ -220,7 +220,7 @@ jobs:
             adb shell "mv -f /data/local/tmp/sqlite3 /system/xbin"
             adb reverse tcp:8931 tcp:8931
             adb shell "cd /data/local/tmp && sqlite3 \":memory:\" -cmd \".bail on\" \".load ./dist/mcp\" \"SELECT mcp_version();\" && ./android-test"
-            pkill -f "@playwright/mcp"
+            exit 0
 
       - name: linux-musl x86_64 test sqlite-mcp
         if: matrix.name == 'linux-musl' && matrix.arch == 'x86_64'
