@@ -34,7 +34,8 @@ MAKEFLAGS += -j$(CPUS)
 CC = gcc
 CARGO_ENV = CARGO_TARGET_DIR=$(RUST_TARGET_DIR)
 ifeq ($(PLATFORM),android)
-	CARGO_ENV += OPENSSL_DIR=$(BIN)/../sysroot/usr
+	OPENSSL_INSTALL_DIR = $(BUILD_DIR)/openssl/$(PLATFORM)/$(ARCH)
+	CARGO_ENV += OPENSSL_DIR=$(CURDIR)/$(OPENSSL_INSTALL_DIR)
 endif
 CARGO = $(CARGO_ENV) cargo
 CFLAGS = -Wall -Wextra -Wno-unused-parameter -I$(SRC_DIR) -I$(LIBS_DIR)
@@ -47,10 +48,6 @@ RUST_TARGET_DIR = $(BUILD_DIR)/rust-target
 LIBS_DIR = libs
 VPATH = $(SRC_DIR)
 
-# Files
-SRC_FILES = $(wildcard $(SRC_DIR)/*.c)
-OBJ_FILES = $(patsubst %.c, $(BUILD_DIR)/%.o, $(notdir $(SRC_FILES)))
-
 # Rust FFI library
 MCP_FFI_LIB = $(RUST_TARGET_DIR)/release/libmcp_ffi.a
 LDFLAGS = -L$(RUST_TARGET_DIR)/release
@@ -62,7 +59,7 @@ ifeq ($(PLATFORM),windows)
 	DEF_FILE := $(BUILD_DIR)/mcp.def
 	STRIP = strip --strip-unneeded $@
 	LIBS = -lmcp_ffi -lws2_32 -luserenv -lbcrypt -lntdll -lgcc -lgcc_eh -lpthread
-	TEST_LIBS = -lm
+	T_LIBS = -lm
 else ifeq ($(PLATFORM),macos)
 	TARGET := $(DIST_DIR)/mcp.dylib
 	MACOS_MIN_VERSION = 11.0
@@ -79,7 +76,7 @@ else ifeq ($(PLATFORM),macos)
 	CARGO = $(CARGO_ENV) cargo
 	STRIP = strip -x -S $@
 	LIBS = -lmcp_ffi -framework CoreFoundation -framework Security -lresolv
-	TEST_LIBS = -lpthread -ldl -lm
+	T_LIBS = -lpthread -ldl -lm
 else ifeq ($(PLATFORM),android)
 	ifndef ARCH
 		$(error "Android ARCH must be set to ARCH=x86_64 or ARCH=arm64-v8a")
@@ -99,13 +96,13 @@ else ifeq ($(PLATFORM),android)
 		ANDROID_ABI := android26
 	endif
 	CC = $(BIN)/$(ARCH)-linux-$(ANDROID_ABI)-clang
-	OPENSSL := $(BIN)/../sysroot/usr/include/openssl
+	OPENSSL = $(OPENSSL_INSTALL_DIR)/lib/libssl.a
 	TARGET := $(DIST_DIR)/mcp.so
-	LDFLAGS += -shared
-	CFLAGS += -fPIC
+	LDFLAGS += -shared -L$(OPENSSL_INSTALL_DIR)/lib
+	CFLAGS += -fPIC -I$(OPENSSL_INSTALL_DIR)/include
 	STRIP = $(BIN)/llvm-strip --strip-unneeded $@
 	LIBS = -lmcp_ffi -ldl -lm -lssl -lcrypto
-	TEST_LIBS = -ldl -lm
+	T_LIBS = -ldl -lm
 else ifeq ($(PLATFORM),ios)
 	TARGET := $(DIST_DIR)/mcp.dylib
 	SDK := -isysroot $(shell xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=11.0
@@ -113,7 +110,7 @@ else ifeq ($(PLATFORM),ios)
 	CFLAGS += -arch arm64 $(SDK)
 	STRIP = strip -x -S $@
 	LIBS = -lmcp_ffi -framework CoreFoundation -framework Security -lSystem -lresolv
-	TEST_LIBS = -lpthread -ldl -lm
+	T_LIBS = -lpthread -ldl -lm
 else ifeq ($(PLATFORM),ios-sim)
 	TARGET := $(DIST_DIR)/mcp.dylib
 	SDK := -isysroot $(shell xcrun --sdk iphonesimulator --show-sdk-path) -miphonesimulator-version-min=11.0
@@ -121,14 +118,14 @@ else ifeq ($(PLATFORM),ios-sim)
 	CFLAGS += -arch x86_64 -arch arm64 $(SDK)
 	STRIP = strip -x -S $@
 	LIBS = -lmcp_ffi -framework CoreFoundation -framework Security -lSystem -lresolv
-	TEST_LIBS = -lpthread -ldl -lm
+	T_LIBS = -lpthread -ldl -lm
 else # linux
 	TARGET := $(DIST_DIR)/mcp.so
 	LDFLAGS += -shared
 	CFLAGS += -fPIC
 	STRIP = strip --strip-unneeded $@
 	LIBS = -lmcp_ffi -lpthread -ldl -lm -lssl -lcrypto
-	TEST_LIBS = -lpthread -ldl -lm
+	T_LIBS = -lpthread -ldl -lm
 endif
 
 # Windows .def file generation
@@ -142,22 +139,20 @@ endif
 $(shell mkdir -p $(BUILD_DIR) $(DIST_DIR))
 all: extension
 
-OPENSSL_SRC = $(BUILD_DIR)/openssl
-OPENSSL_TARBALL = $(BUILD_DIR)/openssl-3.6.0.tar.gz
+OPENSSL_VERSION = openssl-3.6.0
+OPENSSL_TARBALL = $(BUILD_DIR)/$(OPENSSL_VERSION).tar.gz
 $(OPENSSL_TARBALL):
-	curl -L -o $(OPENSSL_TARBALL) https://github.com/openssl/openssl/releases/download/openssl-3.6.0/openssl-3.6.0.tar.gz
+	curl -L -o $(OPENSSL_TARBALL) https://github.com/openssl/openssl/releases/download/$(OPENSSL_VERSION)/$(OPENSSL_VERSION).tar.gz
 
-$(OPENSSL_SRC): $(OPENSSL_TARBALL)
-	tar -xzf $(OPENSSL_TARBALL) -C $(BUILD_DIR); \
-	mv $(BUILD_DIR)/openssl-3.6.0 $(OPENSSL_SRC)
-
-$(OPENSSL): $(OPENSSL_SRC)
-	cd $(BUILD_DIR)/openssl && \
+$(OPENSSL): $(OPENSSL_TARBALL)
+	mkdir -p $(BUILD_DIR)/openssl
+	tar -xzf $(OPENSSL_TARBALL) -C $(BUILD_DIR)/openssl
+	cd $(BUILD_DIR)/openssl/$(OPENSSL_VERSION) && \
 	./Configure android-$(if $(filter aarch64,$(ARCH)),arm64,$(if $(filter armv7a,$(ARCH)),arm,$(ARCH))) \
-		--prefix=$(BIN)/../sysroot/usr \
-		no-shared no-unit-test \
-		-D__ANDROID_API__=26 && \
-	$(MAKE) clean && $(MAKE) && $(MAKE) install_sw
+		--prefix=$(CURDIR)/$(OPENSSL_INSTALL_DIR) \
+		no-shared no-unit-test -D__ANDROID_API__=26 && \
+	$(MAKE) && $(MAKE) install_sw
+	rm -rf $(BUILD_DIR)/openssl/$(OPENSSL_VERSION)
 
 # Build the Rust FFI static library
 ifeq ($(PLATFORM),android)
@@ -239,23 +234,24 @@ else
 	$(CARGO) build --release
 endif
 
-$(BUILD_DIR)/%.o: %.c
-	$(CC) $(CFLAGS) -O3 -fPIC -c $< -o $@
-
-$(TARGET): staticlib $(OBJ_FILES) $(DEF_FILE)
+$(TARGET): staticlib $(DEF_FILE)
 	$(CC) $(CFLAGS) $(SRC_DIR)/sqlite-mcp.c $(LDFLAGS) $(LIBS) -o $@
 	$(STRIP)
 
 extension: $(TARGET)
 
-test: extension
+T_TARGET = $(BUILD_DIR)/test
+$(T_TARGET): $(TARGET)
+	$(CC) $(CFLAGS) -O3 test/main.c $(LIBS_DIR)/sqlite3.c -o $@ $(T_LIBS)
+
+test: $(T_TARGET)
 	$(SQLITE3) ":memory:" -cmd ".bail on" ".load ./dist/mcp" "SELECT mcp_version();"
-	$(CC) -Wall -Wextra -Wno-unused-parameter -O3 -I$(LIBS_DIR) -c $(LIBS_DIR)/sqlite3.c -o $(BUILD_DIR)/sqlite3.o
-	$(CC) -Wall -Wextra -Wno-unused-parameter -O3 -I$(LIBS_DIR) test/main.c $(BUILD_DIR)/sqlite3.o -o $(BUILD_DIR)/test $(TEST_LIBS)
 	$(BUILD_DIR)/test
 
+# clean everything except OpenSSL libs
 clean:
-	rm -rf $(BUILD_DIR) $(DIST_DIR)
+	rm -rf $(DIST_DIR)
+	find $(BUILD_DIR) -mindepth 1 -maxdepth 1 ! -name openssl -exec rm -rf {} +
 	$(CARGO) clean
 
 # XCFramework build for Swift Package Manager
@@ -320,17 +316,12 @@ xcframework: $(DIST_DIR)/mcp.xcframework
 AAR_ARM64 = packages/android/src/main/jniLibs/arm64-v8a/
 AAR_ARM = packages/android/src/main/jniLibs/armeabi-v7a/
 AAR_X86 = packages/android/src/main/jniLibs/x86_64/
-AAR_USR = $(ANDROID_NDK)/toolchains/llvm/prebuilt/$(HOST)-x86_64/sysroot/usr/
-AAR_CLEAN = rm -rf $(AAR_USR)bin/openssl $(AAR_USR)include/openssl $(AAR_USR)lib/libssl.a $(AAR_USR)lib/libcrypto.a $(AAR_USR)lib/ossl-modules
 aar:
 	mkdir -p $(AAR_ARM64) $(AAR_ARM) $(AAR_X86)
-	$(AAR_CLEAN)
 	$(MAKE) clean && $(MAKE) PLATFORM=android ARCH=arm64-v8a
 	mv $(DIST_DIR)/mcp.so $(AAR_ARM64)
-	$(AAR_CLEAN)
 	$(MAKE) clean && $(MAKE) PLATFORM=android ARCH=armeabi-v7a
 	mv $(DIST_DIR)/mcp.so $(AAR_ARM)
-	$(AAR_CLEAN)
 	$(MAKE) clean && $(MAKE) PLATFORM=android ARCH=x86_64
 	mv $(DIST_DIR)/mcp.so $(AAR_X86)
 	cd packages/android && ./gradlew clean assembleRelease
