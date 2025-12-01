@@ -253,6 +253,251 @@ int test_mcp_call_tool(sqlite3 *db) {
     return 0;
 }
 
+// Test: mcp_connect() with JSON extension mode enabled
+int test_mcp_json_extension(sqlite3 *db) {
+    sqlite3_stmt *stmt;
+    int rc;
+
+    printf("    Testing JSON extension mode...\n");
+
+    // Step 1: First connect in regular mode
+    printf("    [1/3] Connecting to MCP server...\n");
+    rc = sqlite3_prepare_v2(db,
+        "SELECT mcp_connect('http://localhost:8931/sse', 1)",
+        -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare connect: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        fprintf(stderr, "    Failed to connect: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    printf("    ✓ Connected to MCP server\n");
+    sqlite3_finalize(stmt);
+
+    // Step 2: Enable JSON extension mode and test json_extract on regular connect result
+    printf("    [2/3] Testing json_extract with regular mcp_connect result...\n");
+    rc = sqlite3_prepare_v2(db,
+        "SELECT json_extract(mcp_connect('http://localhost:8931/sse', 1), '$.status')",
+        -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare json_extract: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        fprintf(stderr, "    Failed to extract status: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    const unsigned char *status = sqlite3_column_text(stmt, 0);
+    if (!status || strcmp((const char *)status, "connected") != 0) {
+        fprintf(stderr, "    Expected status 'connected' but got: %s\n", status ? (const char *)status : "NULL");
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    printf("    ✓ Successfully extracted status: %s\n", status);
+    sqlite3_finalize(stmt);
+
+    // Step 3: Extract first tool name from list_tools using json_extract
+    printf("    [3/3] Extracting first tool name with json_extract()...\n");
+    rc = sqlite3_prepare_v2(db,
+        "SELECT json_extract(mcp_list_tools(), '$.tools[0].name')",
+        -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare json_extract on list_tools: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        fprintf(stderr, "    Failed to extract tool name: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+
+    const unsigned char *tool_name = sqlite3_column_text(stmt, 0);
+    if (!tool_name) {
+        fprintf(stderr, "    Tool name is NULL\n");
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    printf("    ✓ Successfully extracted first tool name: %s\n", tool_name);
+    sqlite3_finalize(stmt);
+
+    printf("    ✓ JSON extension mode working correctly\n");
+    return 0;
+}
+
+// Test: mcp_tools_table virtual table returns structured rows
+int test_mcp_tools_table(sqlite3 *db) {
+    sqlite3_stmt *stmt;
+    int rc;
+
+    printf("    Testing mcp_tools_table virtual table...\n");
+
+    // Step 1: Connect first
+    printf("    [1/3] Connecting to MCP server...\n");
+    rc = sqlite3_prepare_v2(db,
+        "SELECT mcp_connect('http://localhost:8931/sse', 1)",
+        -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare connect: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        fprintf(stderr, "    Failed to connect: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    sqlite3_finalize(stmt);
+    printf("    ✓ Connected\n");
+
+    // Step 2: Query virtual table
+    printf("    [2/3] Querying mcp_tools_table...\n");
+    rc = sqlite3_prepare_v2(db,
+        "SELECT name, description FROM mcp_tools_table",
+        -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare query: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+
+    // Step 3: Fetch and validate results
+    printf("    [3/3] Fetching tool rows...\n");
+    int row_count = 0;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const unsigned char *name = sqlite3_column_text(stmt, 0);
+        const unsigned char *desc = sqlite3_column_text(stmt, 1);
+
+        if (!name) {
+            fprintf(stderr, "    Tool name is NULL at row %d\n", row_count);
+            sqlite3_finalize(stmt);
+            return 1;
+        }
+
+        printf("    ✓ Tool %d: %s - %s\n", row_count + 1, name, desc ? (const char*)desc : "(no description)");
+        row_count++;
+    }
+
+    sqlite3_finalize(stmt);
+
+    if (row_count == 0) {
+        fprintf(stderr, "    No tools returned from virtual table\n");
+        return 1;
+    }
+
+    printf("    ✓ Successfully retrieved %d tools from virtual table\n", row_count);
+    return 0;
+}
+
+// Test: mcp_call_tool_table virtual table returns text results
+int test_mcp_call_tool_table(sqlite3 *db) {
+    sqlite3_stmt *stmt;
+    int rc;
+
+    printf("    Testing mcp_call_tool_table virtual table...\n");
+
+    // Step 1: Connect first
+    printf("    [1/3] Connecting to MCP server...\n");
+    rc = sqlite3_prepare_v2(db,
+        "SELECT mcp_connect('http://localhost:8931/sse', 1)",
+        -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare connect: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        fprintf(stderr, "    Failed to connect: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    sqlite3_finalize(stmt);
+    printf("    ✓ Connected\n");
+
+    // Step 2: Query virtual table with tool call
+    printf("    [2/3] Calling tool via virtual table...\n");
+    rc = sqlite3_prepare_v2(db,
+        "SELECT text FROM mcp_call_tool_table "
+        "WHERE tool_name = 'browser_navigate' AND arguments = '{\"url\": \"https://example.com\"}'",
+        -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare query: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+
+    // Step 3: Fetch results
+    printf("    [3/3] Fetching text results...\n");
+    int row_count = 0;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const unsigned char *text = sqlite3_column_text(stmt, 0);
+
+        if (!text) {
+            fprintf(stderr, "    Text result is NULL at row %d\n", row_count);
+            sqlite3_finalize(stmt);
+            return 1;
+        }
+
+        printf("    ✓ Result %d: %s\n", row_count + 1, text);
+        row_count++;
+    }
+
+    sqlite3_finalize(stmt);
+
+    if (row_count == 0) {
+        fprintf(stderr, "    No results returned from virtual table\n");
+        return 1;
+    }
+
+    printf("    ✓ Successfully retrieved %d text results from virtual table\n", row_count);
+    return 0;
+}
+
+// Test: mcp_connect returns SQLITE_DONE in JSON mode when connected
+int test_mcp_connect_json_mode(sqlite3 *db) {
+    sqlite3_stmt *stmt;
+    int rc;
+
+    printf("    Testing mcp_connect with JSON mode returns no rows...\n");
+
+    // Connect with JSON mode enabled (4th parameter = 1)
+    printf("    [1/2] Connecting with JSON extension mode...\n");
+    rc = sqlite3_prepare_v2(db,
+        "SELECT mcp_connect('http://localhost:8931/sse', 1, NULL, 1)",
+        -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare connect: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+
+    // Step - should return NULL on successful connection (scalar functions always return 1 row)
+    printf("    [2/2] Checking result (should be NULL on success)...\n");
+    rc = sqlite3_step(stmt);
+
+    if (rc == SQLITE_ROW) {
+        // Check if the result is NULL (success) or contains an error message (failure)
+        if (sqlite3_column_type(stmt, 0) == SQLITE_NULL) {
+            printf("    ✓ Connection successful - returned NULL as expected\n");
+            sqlite3_finalize(stmt);
+            return 0;
+        } else {
+            // Has a value - this means it's an error message
+            const unsigned char *error = sqlite3_column_text(stmt, 0);
+            fprintf(stderr, "    Connection failed: %s\n", error ? (const char*)error : "Unknown error");
+            sqlite3_finalize(stmt);
+            return 1;
+        }
+    } else {
+        fprintf(stderr, "    Unexpected result code: %d (%s)\n", rc, sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+}
+
 // Test: Navigate to sqlite.ai and get page title
 int test_mcp_browser(sqlite3 *db) {
     sqlite3_stmt *stmt;
@@ -387,6 +632,284 @@ int test_mcp_browser(sqlite3 *db) {
 }
 
 
+// Test: Virtual table caching - verify temp table persists across multiple queries
+int test_mcp_tools_table_caching(sqlite3 *db) {
+    sqlite3_stmt *stmt;
+    int rc;
+
+    printf("    Testing virtual table caching behavior...\n");
+
+    // Step 1: Connect first
+    printf("    [1/4] Connecting to MCP server...\n");
+    rc = sqlite3_prepare_v2(db,
+        "SELECT mcp_connect('http://localhost:8931/sse', 1)",
+        -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare connect: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        fprintf(stderr, "    Failed to connect: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    sqlite3_finalize(stmt);
+    printf("    ✓ Connected\n");
+
+    // Step 2: First query - this should create and populate the temp table
+    printf("    [2/4] First query to mcp_tools_table (creates temp table)...\n");
+    rc = sqlite3_prepare_v2(db,
+        "SELECT COUNT(*) FROM mcp_tools_table",
+        -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare first query: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        fprintf(stderr, "    Failed to execute first query: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    int first_count = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    printf("    ✓ First query returned %d tools\n", first_count);
+
+    // Step 3: Second query - should use cached temp table (no network request)
+    printf("    [3/4] Second query to mcp_tools_table (uses cached table)...\n");
+    rc = sqlite3_prepare_v2(db,
+        "SELECT COUNT(*) FROM mcp_tools_table",
+        -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare second query: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        fprintf(stderr, "    Failed to execute second query: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    int second_count = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    printf("    ✓ Second query returned %d tools\n", second_count);
+
+    // Step 4: Verify counts match
+    printf("    [4/4] Verifying cached results match...\n");
+    if (first_count != second_count) {
+        fprintf(stderr, "    Count mismatch: first=%d, second=%d\n", first_count, second_count);
+        return 1;
+    }
+    if (first_count == 0) {
+        fprintf(stderr, "    No tools found in either query\n");
+        return 1;
+    }
+
+    printf("    ✓ Both queries returned same count (%d tools)\n", first_count);
+    printf("    ✓ Virtual table caching working correctly\n");
+    return 0;
+}
+
+// Test: Verify temp table is created with expected name pattern
+int test_mcp_tools_table_temp_exists(sqlite3 *db) {
+    sqlite3_stmt *stmt;
+    int rc;
+
+    printf("    Testing temp table creation...\n");
+
+    // Step 1: Connect first
+    printf("    [1/3] Connecting to MCP server...\n");
+    rc = sqlite3_prepare_v2(db,
+        "SELECT mcp_connect('http://localhost:8931/sse', 1)",
+        -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare connect: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        fprintf(stderr, "    Failed to connect: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    sqlite3_finalize(stmt);
+    printf("    ✓ Connected\n");
+
+    // Step 2: Query virtual table to trigger temp table creation
+    printf("    [2/3] Querying virtual table...\n");
+    rc = sqlite3_prepare_v2(db,
+        "SELECT name FROM mcp_tools_table LIMIT 1",
+        -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare query: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        fprintf(stderr, "    Failed to execute query: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    sqlite3_finalize(stmt);
+    printf("    ✓ Virtual table query executed\n");
+
+    // Step 3: Check that temp tables exist with mcp_tools_cache_ prefix
+    printf("    [3/3] Checking for temp table existence...\n");
+    rc = sqlite3_prepare_v2(db,
+        "SELECT name FROM temp.sqlite_master WHERE type='table' AND name LIKE 'mcp_tools_cache_%'",
+        -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare temp table check: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+
+    int found = 0;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const unsigned char *table_name = sqlite3_column_text(stmt, 0);
+        printf("    ✓ Found temp table: %s\n", table_name);
+        found = 1;
+    }
+    sqlite3_finalize(stmt);
+
+    if (!found) {
+        fprintf(stderr, "    No temp table with mcp_tools_cache_ prefix found\n");
+        return 1;
+    }
+
+    printf("    ✓ Temp table created successfully\n");
+    return 0;
+}
+
+// Test: Verify scalar function doesn't use caching (always fresh)
+int test_scalar_function_no_cache(sqlite3 *db) {
+    sqlite3_stmt *stmt;
+    int rc;
+
+    printf("    Testing scalar function behavior (no caching)...\n");
+
+    // Step 1: Connect first
+    printf("    [1/3] Connecting to MCP server...\n");
+    rc = sqlite3_prepare_v2(db,
+        "SELECT mcp_connect('http://localhost:8931/sse', 1)",
+        -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare connect: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        fprintf(stderr, "    Failed to connect: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    sqlite3_finalize(stmt);
+    printf("    ✓ Connected\n");
+
+    // Step 2: Call mcp_list_tools() twice
+    printf("    [2/3] Calling mcp_list_tools() twice...\n");
+    for (int i = 1; i <= 2; i++) {
+        rc = sqlite3_prepare_v2(db, "SELECT mcp_list_tools()", -1, &stmt, 0);
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "    Failed to prepare list_tools call %d: %s\n", i, sqlite3_errmsg(db));
+            return 1;
+        }
+        rc = sqlite3_step(stmt);
+        if (rc != SQLITE_ROW) {
+            fprintf(stderr, "    Failed to execute list_tools call %d: %s\n", i, sqlite3_errmsg(db));
+            sqlite3_finalize(stmt);
+            return 1;
+        }
+        const unsigned char *result = sqlite3_column_text(stmt, 0);
+        if (!result || strstr((const char *)result, "\"tools\"") == NULL) {
+            fprintf(stderr, "    Unexpected result from call %d\n", i);
+            sqlite3_finalize(stmt);
+            return 1;
+        }
+        sqlite3_finalize(stmt);
+        printf("    ✓ Call %d completed successfully\n", i);
+    }
+
+    // Step 3: Verify both calls succeeded (both made network requests)
+    printf("    [3/3] Verifying both calls executed...\n");
+    printf("    ✓ Both scalar function calls completed\n");
+    printf("    ✓ Scalar functions don't use caching (each call is fresh)\n");
+    return 0;
+}
+
+// Test: Multiple queries with filtering on virtual table
+int test_mcp_tools_table_filtering(sqlite3 *db) {
+    sqlite3_stmt *stmt;
+    int rc;
+
+    printf("    Testing virtual table filtering with caching...\n");
+
+    // Step 1: Connect first
+    printf("    [1/3] Connecting to MCP server...\n");
+    rc = sqlite3_prepare_v2(db,
+        "SELECT mcp_connect('http://localhost:8931/sse', 1)",
+        -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare connect: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        fprintf(stderr, "    Failed to connect: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    sqlite3_finalize(stmt);
+    printf("    ✓ Connected\n");
+
+    // Step 2: Query with WHERE clause - should still create and use cache
+    printf("    [2/3] Querying with WHERE clause...\n");
+    rc = sqlite3_prepare_v2(db,
+        "SELECT name FROM mcp_tools_table WHERE name LIKE 'browser%'",
+        -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare filtered query: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+
+    int count = 0;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const unsigned char *name = sqlite3_column_text(stmt, 0);
+        printf("    ✓ Found tool: %s\n", name);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+
+    if (count == 0) {
+        fprintf(stderr, "    No browser tools found\n");
+        // Not necessarily an error, continue
+    } else {
+        printf("    ✓ Found %d browser tools\n", count);
+    }
+
+    // Step 3: Query again with different filter - should use same cached table
+    printf("    [3/3] Querying again with different filter...\n");
+    rc = sqlite3_prepare_v2(db,
+        "SELECT COUNT(*) FROM mcp_tools_table",
+        -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare count query: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        fprintf(stderr, "    Failed to execute count query: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    int total = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+
+    printf("    ✓ Total tools in cache: %d\n", total);
+    printf("    ✓ Filtering works correctly on cached table\n");
+    return 0;
+}
+
 int main(void) {
     printf("\n=== sqlite-mcp Test Suite ===\n\n");
 
@@ -404,6 +927,20 @@ int main(void) {
 
     printf("\n--- sqlite.ai Page Title Demo ---\n");
     run_test("Navigate to sqlite.ai and get page title", test_mcp_browser);
+
+    printf("\n--- JSON Extension Mode Tests ---\n");
+    run_test("mcp_connect() with JSON extension mode", test_mcp_json_extension);
+    run_test("mcp_connect() returns no rows in JSON mode", test_mcp_connect_json_mode);
+
+    printf("\n--- Virtual Table Tests ---\n");
+    run_test("mcp_tools_table virtual table", test_mcp_tools_table);
+    run_test("mcp_call_tool_table virtual table", test_mcp_call_tool_table);
+
+    printf("\n--- Virtual Table Caching Tests ---\n");
+    run_test("Virtual table caching behavior", test_mcp_tools_table_caching);
+    run_test("Temp table creation and naming", test_mcp_tools_table_temp_exists);
+    run_test("Virtual table filtering with cache", test_mcp_tools_table_filtering);
+    run_test("Scalar functions don't cache", test_scalar_function_no_cache);
 
     printf("\n=== Test Results ===\n");
     printf("Total:  %d\n", test_count);

@@ -8,9 +8,7 @@ A SQLite extension that integrates the [Model Context Protocol (MCP)](https://mo
 
 #### Pre-built Binaries
 
-Download for your platform: **macOS**, **Linux**, **Windows**, **Android**, and **iOS**
-
-Or build from source (see [Building from Source](#building-from-source)).
+Download for your platform: **macOS**, **Linux**, **Windows**, **Android**, and **iOS**.
 
 ### Basic Usage
 
@@ -88,57 +86,7 @@ Server-Sent Events for compatibility with older servers.
 SELECT mcp_connect('http://localhost:8931/sse', 1);
 ```
 
-## 🚦 Usage with Different Languages
-
-### Python
-
-```python
-import sqlite3
-
-conn = sqlite3.connect('data.db')
-conn.enable_load_extension(True)
-conn.load_extension('./dist/mcp')
-
-cursor = conn.cursor()
-
-# Connect to MCP server
-cursor.execute("SELECT mcp_connect('http://localhost:8000/mcp')")
-
-# List tools
-result = cursor.execute("SELECT mcp_list_tools()").fetchone()[0]
-tools = json.loads(result)
-print(f"Available tools: {len(tools['tools'])}")
-
-# Call a tool
-cursor.execute("""
-    SELECT mcp_call_tool('airbnb_search',
-                         '{"location": "Paris", "maxPrice": 150}')
-""")
-result = cursor.fetchone()[0]
-print(result)
-```
-
-### Node.js
-
-```javascript
-const Database = require('better-sqlite3');
-const db = new Database(':memory:');
-
-db.loadExtension('./dist/mcp');
-
-// Connect to MCP server
-const result = db.prepare("SELECT mcp_connect('http://localhost:8000/mcp')").get();
-console.log(result);
-
-// Call tool
-const listings = db.prepare(`
-    SELECT mcp_call_tool('airbnb_search',
-                         '{"location": "Tokyo", "adults": 2}')
-`).get();
-console.log(listings);
-```
-
-### C
+## 🚦 Quick Usage Example
 
 ```c
 #include <sqlite3.h>
@@ -174,6 +122,8 @@ int main() {
 }
 ```
 
+See [USAGE.md](USAGE.md) for complete usage examples.
+
 ## 🤝 Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
@@ -184,8 +134,8 @@ MIT License - See [LICENSE](LICENSE) for details
 
 ## 🔗 Related Projects
 
-- [sqlite-agent](https://github.com/sqlitecloud/sqlite-agent) - A powerful AI agent for SQLite
-- [sqlite-ai](https://github.com/sqlitecloud/sqlite-ai) - LLM integration for SQLite
-- [sqlite-vector](https://github.com/sqlitecloud/sqlite-vector) - Vector search extension
-- [sqlite-sync](https://github.com/sqlitecloud/sqlite-sync) - Cloud synchronization
-- [sqlite-js](https://github.com/sqlitecloud/sqlite-js) - JavaScript engine integration
+- [sqlite-agent](https://github.com/sqliteai/sqlite-agent) - A powerful AI agent for SQLite
+- [sqlite-ai](https://github.com/sqliteai/sqlite-ai) - LLM integration for SQLite
+- [sqlite-vector](https://github.com/sqliteai/sqlite-vector) - Vector search extension
+- [sqlite-sync](https://github.com/sqliteai/sqlite-sync) - Cloud synchronization
+- [sqlite-js](https://github.com/sqliteai/sqlite-js) - JavaScript engine integration
