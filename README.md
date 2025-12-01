@@ -40,9 +40,11 @@ SELECT mcp_call_tool('airbnb_search', '{"location": "Rome", "maxPrice": 100}');
 | Function | Description |
 |----------|-------------|
 | `mcp_version()` | Returns extension version |
-| `mcp_connect(url, [sse], [headers])` | Connect to MCP server with optional custom headers |
+| `mcp_connect(url, [sse], [headers], [use_json_ext])` | Connect to MCP server with optional custom headers and JSON extension mode |
 | `mcp_list_tools()` | List available tools with schemas |
 | `mcp_call_tool(name, args)` | Call a tool on the MCP server |
+| `mcp_tools_table` | Virtual table that returns each tool as a row with structured columns |
+| `mcp_call_tool_table` | Virtual table that extracts text results from tool calls |
 
 See [API.md](API.md) for complete API documentation with examples.
 
