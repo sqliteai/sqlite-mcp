@@ -412,6 +412,8 @@ jobs:
           echo "✅ Successfully published packages to npm"
           echo "   Main: @sqliteai/sqlite-mcp@${{ steps.tag.outputs.version }}"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - uses: softprops/action-gh-release@v2.2.1
         if: steps.tag.outputs.version != ''
