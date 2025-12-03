@@ -14,14 +14,25 @@ use rmcp::transport::{SseClientTransport, StreamableHttpClientTransport};
 use rmcp::{ServiceExt, RoleClient};
 use rmcp::model::{ClientInfo, ClientCapabilities, Implementation};
 
-// Global client instance (simplified approach - one client per process)
+// Global runtime instance - single runtime for entire process
+static GLOBAL_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+// Global client instance 
 static GLOBAL_CLIENT: OnceLock<Mutex<Option<McpClient>>> = OnceLock::new();
+
+/// Get or create the global Tokio runtime
+fn get_runtime() -> &'static tokio::runtime::Runtime {
+    GLOBAL_RUNTIME.get_or_init(|| {
+        tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime")
+    })
+}
 
 /// Initialize the MCP library
 /// Returns 0 on success, non-zero on error
 #[no_mangle]
 pub extern "C" fn mcp_init() -> i32 {
-    // Initialize any global state here
+    // Initialize the runtime early
+    let _ = get_runtime();
     0
 }
 
@@ -51,7 +62,6 @@ type RunningClient = rmcp::service::RunningService<RoleClient, ClientInfo>;
 
 /// Opaque handle for MCP client
 pub struct McpClient {
-    runtime: tokio::runtime::Runtime,
     service: Mutex<Option<RunningClient>>,
     server_url: Mutex<Option<String>>,
 }
@@ -60,17 +70,14 @@ pub struct McpClient {
 /// Returns NULL on error
 #[no_mangle]
 pub extern "C" fn mcp_client_new() -> *mut McpClient {
-    match tokio::runtime::Runtime::new() {
-        Ok(runtime) => {
-            let client = Box::new(McpClient {
-                runtime,
-                service: Mutex::new(None),
-                server_url: Mutex::new(None),
-            });
-            Box::into_raw(client)
-        }
-        Err(_) => ptr::null_mut(),
-    }
+    // Initialize runtime early
+    let _ = get_runtime();
+    
+    let client = Box::new(McpClient {
+        service: Mutex::new(None),
+        server_url: Mutex::new(None),
+    });
+    Box::into_raw(client)
 }
 
 /// Free an MCP client
@@ -137,24 +144,18 @@ pub extern "C" fn mcp_connect(
         }
     };
 
-    // Create a new McpClient with runtime
+    // Create a new McpClient 
     let new_client = McpClient {
-        runtime: match tokio::runtime::Runtime::new() {
-            Ok(r) => r,
-            Err(e) => {
-                let error = format!(r#"{{"error": "Failed to create runtime: {}"}}"#, e);
-                return CString::new(error).unwrap_or_default().into_raw();
-            }
-        },
         service: Mutex::new(None),
         server_url: Mutex::new(None),
     };
 
     let use_sse = legacy_sse != 0;
+    let runtime = get_runtime();
 
     let (result, maybe_service) = if use_sse {
         // Use SSE transport (legacy) with optional custom headers
-        new_client.runtime.block_on(async {
+        runtime.block_on(async {
             // Create HTTP client with optional custom headers
             let mut client_builder = reqwest::Client::builder();
             if let Some(ref headers_map) = headers_map {
@@ -240,7 +241,7 @@ pub extern "C" fn mcp_connect(
         })
     } else {
         // Use streamable HTTP transport (default) with optional custom headers
-        new_client.runtime.block_on(async {
+        runtime.block_on(async {
             // For Streamable HTTP, we need to extract the Authorization header specifically
             // since it has a dedicated field, and we'll use a custom HTTP client for other headers
             let auth_header_value = headers_map.as_ref().and_then(|m| m.get("Authorization")).map(|s| s.clone());
@@ -368,7 +369,8 @@ pub extern "C" fn mcp_list_tools(_client_ptr: *mut McpClient) -> *mut c_char {
         }
     };
 
-    let result = client.runtime.block_on(async {
+    let runtime = get_runtime();
+    let result = runtime.block_on(async {
         let service_guard = client.service.lock().unwrap();
         let service = match service_guard.as_ref() {
             Some(s) => s,
@@ -462,7 +464,8 @@ pub extern "C" fn mcp_call_tool(
         }
     };
 
-    let result = client.runtime.block_on(async {
+    let runtime = get_runtime();
+    let result = runtime.block_on(async {
         let service_guard = client.service.lock().unwrap();
         let service = match service_guard.as_ref() {
             Some(s) => s,
