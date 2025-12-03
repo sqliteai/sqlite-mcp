@@ -8,65 +8,14 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::thread;
+use std::sync::{Mutex, OnceLock};
 
 use rmcp::transport::{SseClientTransport, StreamableHttpClientTransport};
 use rmcp::{ServiceExt, RoleClient};
 use rmcp::model::{ClientInfo, ClientCapabilities, Implementation};
 
-// Global client instance 
+// Global client instance - one client per process
 static GLOBAL_CLIENT: OnceLock<Mutex<Option<McpClient>>> = OnceLock::new();
-
-// Global background runtime
-static BACKGROUND_RUNTIME: OnceLock<(
-    tokio::sync::mpsc::UnboundedSender<Box<dyn FnOnce() + Send + 'static>>,
-    thread::JoinHandle<()>
-)> = OnceLock::new();
-
-/// Initialize background runtime thread
-fn get_background_runtime() -> &'static tokio::sync::mpsc::UnboundedSender<Box<dyn FnOnce() + Send + 'static>> {
-    let (tx, _handle) = BACKGROUND_RUNTIME.get_or_init(|| {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Box<dyn FnOnce() + Send + 'static>>();
-        
-        let handle = thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create background runtime");
-                
-            rt.block_on(async {
-                while let Some(task) = rx.recv().await {
-                    task();
-                }
-            });
-        });
-        
-        (tx, handle)
-    });
-    tx
-}
-
-/// Execute async code using dedicated background thread
-fn execute_async_sync<F, R>(future: F) -> R 
-where 
-    F: std::future::Future<Output = R> + Send + 'static,
-    R: Send + 'static,
-{
-    let (tx, rx) = std::sync::mpsc::channel();
-    let sender = get_background_runtime();
-    
-    let task = Box::new(move || {
-        let handle = tokio::runtime::Handle::current();
-        handle.spawn(async move {
-            let result = future.await;
-            let _ = tx.send(result);
-        });
-    });
-    
-    sender.send(task).expect("Failed to send task to background thread");
-    rx.recv().expect("Failed to receive result from background thread")
-}
 
 /// Initialize the MCP library
 /// Returns 0 on success, non-zero on error
@@ -101,7 +50,8 @@ type RunningClient = rmcp::service::RunningService<RoleClient, ClientInfo>;
 
 /// Opaque handle for MCP client
 pub struct McpClient {
-    service: Mutex<Option<Arc<RunningClient>>>,
+    runtime: tokio::runtime::Runtime,
+    service: Mutex<Option<RunningClient>>,
     server_url: Mutex<Option<String>>,
 }
 
@@ -109,11 +59,17 @@ pub struct McpClient {
 /// Returns NULL on error
 #[no_mangle]
 pub extern "C" fn mcp_client_new() -> *mut McpClient {
-    let client = Box::new(McpClient {
-        service: Mutex::new(None),
-        server_url: Mutex::new(None),
-    });
-    Box::into_raw(client)
+    match tokio::runtime::Runtime::new() {
+        Ok(runtime) => {
+            let client = Box::new(McpClient {
+                runtime,
+                service: Mutex::new(None),
+                server_url: Mutex::new(None),
+            });
+            Box::into_raw(client)
+        }
+        Err(_) => ptr::null_mut(),
+    }
 }
 
 /// Free an MCP client
@@ -180,8 +136,15 @@ pub extern "C" fn mcp_connect(
         }
     };
 
-    // Create a new McpClient 
+    // Create a new McpClient with runtime
     let new_client = McpClient {
+        runtime: match tokio::runtime::Runtime::new() {
+            Ok(r) => r,
+            Err(e) => {
+                let error = format!(r#"{{"error": "Failed to create runtime: {}"}}"#, e);
+                return CString::new(error).unwrap_or_default().into_raw();
+            }
+        },
         service: Mutex::new(None),
         server_url: Mutex::new(None),
     };
@@ -190,7 +153,7 @@ pub extern "C" fn mcp_connect(
 
     let (result, maybe_service) = if use_sse {
         // Use SSE transport (legacy) with optional custom headers
-        execute_async_sync(async move {
+        new_client.runtime.block_on(async {
             // Create HTTP client with optional custom headers
             let mut client_builder = reqwest::Client::builder();
             if let Some(ref headers_map) = headers_map {
@@ -276,7 +239,7 @@ pub extern "C" fn mcp_connect(
         })
     } else {
         // Use streamable HTTP transport (default) with optional custom headers
-        execute_async_sync(async move {
+        new_client.runtime.block_on(async {
             // For Streamable HTTP, we need to extract the Authorization header specifically
             // since it has a dedicated field, and we'll use a custom HTTP client for other headers
             let auth_header_value = headers_map.as_ref().and_then(|m| m.get("Authorization")).map(|s| s.clone());
@@ -375,7 +338,7 @@ pub extern "C" fn mcp_connect(
 
     // Store service and URL if connection succeeded
     if let Some((service, url)) = maybe_service {
-        *new_client.service.lock().unwrap() = Some(Arc::new(service));
+        *new_client.service.lock().unwrap() = Some(service);
         *new_client.server_url.lock().unwrap() = Some(url);
 
         // Store the client globally
@@ -393,29 +356,26 @@ pub extern "C" fn mcp_connect(
 /// Returns: JSON string with tools list (must be freed with mcp_free_string)
 #[no_mangle]
 pub extern "C" fn mcp_list_tools(_client_ptr: *mut McpClient) -> *mut c_char {
-    // Get global client and extract service in main thread
-    let service = {
-        let global_client_guard = GLOBAL_CLIENT.get()
-            .and_then(|c| Some(c.lock().unwrap()));
-        let client = match global_client_guard.as_ref().and_then(|g| g.as_ref()) {
-            Some(c) => c,
-            None => {
-                let error = r#"{"error": "Not connected. Call mcp_connect() first"}"#;
-                return CString::new(error).unwrap_or_default().into_raw();
-            }
-        };
-        
-        let service_guard = client.service.lock().unwrap();
-        match service_guard.as_ref() {
-            Some(s) => Arc::clone(s), // Clone the Arc to move to thread
-            None => {
-                let error = r#"{"error": "Not connected to server"}"#;
-                return CString::new(error).unwrap_or_default().into_raw();
-            }
+    // Get global client
+    let global_client_guard = GLOBAL_CLIENT.get()
+        .and_then(|c| Some(c.lock().unwrap()));
+    let client = match global_client_guard.as_ref().and_then(|g| g.as_ref()) {
+        Some(c) => c,
+        None => {
+            let error = r#"{"error": "Not connected. Call mcp_connect() first"}"#;
+            return CString::new(error).unwrap_or_default().into_raw();
         }
     };
 
-    let result = execute_async_sync(async move {
+    let result = client.runtime.block_on(async {
+        let service_guard = client.service.lock().unwrap();
+        let service = match service_guard.as_ref() {
+            Some(s) => s,
+            None => {
+                return r#"{"error": "Not connected to server"}"#.to_string();
+            }
+        };
+
         match service.list_tools(Default::default()).await {
             Ok(tools_response) => {
                 let tools_json: Vec<serde_json::Value> = tools_response
@@ -490,29 +450,26 @@ pub extern "C" fn mcp_call_tool(
         }
     };
 
-    // Get global client and extract service in main thread
-    let service = {
-        let global_client_guard = GLOBAL_CLIENT.get()
-            .and_then(|c| Some(c.lock().unwrap()));
-        let client = match global_client_guard.as_ref().and_then(|g| g.as_ref()) {
-            Some(c) => c,
-            None => {
-                let error = r#"{"error": "Not connected. Call mcp_connect() first"}"#;
-                return CString::new(error).unwrap_or_default().into_raw();
-            }
-        };
-        
-        let service_guard = client.service.lock().unwrap();
-        match service_guard.as_ref() {
-            Some(s) => Arc::clone(s), // Clone the Arc to move to thread
-            None => {
-                let error = r#"{"error": "Not connected to server"}"#;
-                return CString::new(error).unwrap_or_default().into_raw();
-            }
+    // Get global client
+    let global_client_guard = GLOBAL_CLIENT.get()
+        .and_then(|c| Some(c.lock().unwrap()));
+    let client = match global_client_guard.as_ref().and_then(|g| g.as_ref()) {
+        Some(c) => c,
+        None => {
+            let error = r#"{"error": "Not connected. Call mcp_connect() first"}"#;
+            return CString::new(error).unwrap_or_default().into_raw();
         }
     };
 
-    let result = execute_async_sync(async move {
+    let result = client.runtime.block_on(async {
+        let service_guard = client.service.lock().unwrap();
+        let service = match service_guard.as_ref() {
+            Some(s) => s,
+            None => {
+                return r#"{"error": "Not connected to server"}"#.to_string();
+            }
+        };
+
         let call_param = rmcp::model::CallToolRequestParam {
             name: std::borrow::Cow::Owned(tool_name_str),
             arguments: arguments.as_object().cloned(),
