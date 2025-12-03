@@ -32,13 +32,13 @@ MAKEFLAGS += -j$(CPUS)
 
 # Compiler and flags
 CC = gcc
-CARGO_ENV = CARGO_TARGET_DIR=$(RUST_TARGET_DIR)
+CARGO_ENV = CARGO_TARGET_DIR=$(RUST_TARGET_DIR) RUSTFLAGS="-C opt-level=z -C lto=fat -C codegen-units=1 -C strip=symbols"
 ifeq ($(PLATFORM),android)
 	OPENSSL_INSTALL_DIR = $(BUILD_DIR)/openssl/$(PLATFORM)/$(ARCH)
 	CARGO_ENV += OPENSSL_DIR=$(CURDIR)/$(OPENSSL_INSTALL_DIR)
 endif
 CARGO = $(CARGO_ENV) cargo
-CFLAGS = -Wall -Wextra -Wno-unused-parameter -I$(SRC_DIR) -I$(LIBS_DIR)
+CFLAGS = -Wall -Wextra -Wno-unused-parameter -I$(SRC_DIR) -I$(LIBS_DIR) -Os -ffunction-sections -fdata-sections
 
 # Directories
 SRC_DIR = src
@@ -50,7 +50,7 @@ VPATH = $(SRC_DIR)
 
 # Rust FFI library
 MCP_FFI_LIB = $(RUST_TARGET_DIR)/release/libmcp_ffi.a
-LDFLAGS = -L$(RUST_TARGET_DIR)/release
+LDFLAGS = -L$(RUST_TARGET_DIR)/release -Wl,-dead_strip
 
 # Platform-specific settings
 ifeq ($(PLATFORM),windows)
@@ -74,7 +74,7 @@ else ifeq ($(PLATFORM),macos)
 	CFLAGS += -mmacosx-version-min=$(MACOS_MIN_VERSION)
 	CARGO_ENV += MACOSX_DEPLOYMENT_TARGET=$(MACOS_MIN_VERSION)
 	CARGO = $(CARGO_ENV) cargo
-	STRIP = strip -x -S $@
+	STRIP = strip -x -S -r $@
 	LIBS = -lmcp_ffi -framework CoreFoundation -framework Security -lresolv
 	T_LIBS = -lpthread -ldl -lm
 else ifeq ($(PLATFORM),android)

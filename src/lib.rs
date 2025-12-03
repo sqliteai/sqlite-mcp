@@ -8,16 +8,14 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use rmcp::transport::{SseClientTransport, StreamableHttpClientTransport};
 use rmcp::{ServiceExt, RoleClient};
 use rmcp::model::{ClientInfo, ClientCapabilities, Implementation};
 
 // Global client instance (simplified approach - one client per process)
-lazy_static::lazy_static! {
-    static ref GLOBAL_CLIENT: Mutex<Option<McpClient>> = Mutex::new(None);
-}
+static GLOBAL_CLIENT: OnceLock<Mutex<Option<McpClient>>> = OnceLock::new();
 
 /// Initialize the MCP library
 /// Returns 0 on success, non-zero on error
@@ -345,8 +343,8 @@ pub extern "C" fn mcp_connect(
         *new_client.server_url.lock().unwrap() = Some(url);
 
         // Store the client globally
-        let mut global_client = GLOBAL_CLIENT.lock().unwrap();
-        *global_client = Some(new_client);
+        let global_client = GLOBAL_CLIENT.get_or_init(|| Mutex::new(None));
+        *global_client.lock().unwrap() = Some(new_client);
     }
 
     match CString::new(result) {
@@ -360,8 +358,9 @@ pub extern "C" fn mcp_connect(
 #[no_mangle]
 pub extern "C" fn mcp_list_tools(_client_ptr: *mut McpClient) -> *mut c_char {
     // Get global client
-    let global_client_guard = GLOBAL_CLIENT.lock().unwrap();
-    let client = match global_client_guard.as_ref() {
+    let global_client_guard = GLOBAL_CLIENT.get()
+        .and_then(|c| Some(c.lock().unwrap()));
+    let client = match global_client_guard.as_ref().and_then(|g| g.as_ref()) {
         Some(c) => c,
         None => {
             let error = r#"{"error": "Not connected. Call mcp_connect() first"}"#;
@@ -453,8 +452,9 @@ pub extern "C" fn mcp_call_tool(
     };
 
     // Get global client
-    let global_client_guard = GLOBAL_CLIENT.lock().unwrap();
-    let client = match global_client_guard.as_ref() {
+    let global_client_guard = GLOBAL_CLIENT.get()
+        .and_then(|c| Some(c.lock().unwrap()));
+    let client = match global_client_guard.as_ref().and_then(|g| g.as_ref()) {
         Some(c) => c,
         None => {
             let error = r#"{"error": "Not connected. Call mcp_connect() first"}"#;
