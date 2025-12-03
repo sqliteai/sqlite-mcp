@@ -55,7 +55,7 @@ LDFLAGS = -L$(RUST_TARGET_DIR)/release
 # Platform-specific settings
 ifeq ($(PLATFORM),windows)
 	TARGET := $(DIST_DIR)/mcp.dll
-	LDFLAGS += -shared -Wl,--dead_strip
+	LDFLAGS += -shared -Wl,--gc-sections
 	DEF_FILE := $(BUILD_DIR)/mcp.def
 	STRIP = strip --strip-unneeded $@
 	LIBS = -lmcp_ffi -lws2_32 -luserenv -lbcrypt -lntdll -lgcc -lgcc_eh -lpthread
