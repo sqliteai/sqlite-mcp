@@ -32,7 +32,7 @@ MAKEFLAGS += -j$(CPUS)
 
 # Compiler and flags
 CC = gcc
-CARGO_ENV = CARGO_TARGET_DIR=$(RUST_TARGET_DIR) RUSTFLAGS="-C opt-level=z -C lto=fat -C codegen-units=1 -C strip=symbols"
+CARGO_ENV = CARGO_TARGET_DIR=$(RUST_TARGET_DIR) RUSTFLAGS="$(RUSTFLAGS)"
 ifeq ($(PLATFORM),android)
 	OPENSSL_INSTALL_DIR = $(BUILD_DIR)/openssl/$(PLATFORM)/$(ARCH)
 	CARGO_ENV += OPENSSL_DIR=$(CURDIR)/$(OPENSSL_INSTALL_DIR)
@@ -50,16 +50,17 @@ VPATH = $(SRC_DIR)
 
 # Rust FFI library
 MCP_FFI_LIB = $(RUST_TARGET_DIR)/release/libmcp_ffi.a
-LDFLAGS = -L$(RUST_TARGET_DIR)/release -Wl,-dead_strip
+LDFLAGS = -L$(RUST_TARGET_DIR)/release
 
 # Platform-specific settings
 ifeq ($(PLATFORM),windows)
 	TARGET := $(DIST_DIR)/mcp.dll
-	LDFLAGS += -shared
+	LDFLAGS += -shared -Wl,--gc-sections
 	DEF_FILE := $(BUILD_DIR)/mcp.def
 	STRIP = strip --strip-unneeded $@
 	LIBS = -lmcp_ffi -lws2_32 -luserenv -lbcrypt -lntdll -lgcc -lgcc_eh -lpthread
 	T_LIBS = -lm
+	RUSTFLAGS = -C opt-level=z -C lto=fat -C codegen-units=1 -C strip=symbols
 else ifeq ($(PLATFORM),macos)
 	TARGET := $(DIST_DIR)/mcp.dylib
 	MACOS_MIN_VERSION = 11.0
@@ -70,13 +71,14 @@ else ifeq ($(PLATFORM),macos)
 		LDFLAGS += -arch $(ARCH)
 		CFLAGS += -arch $(ARCH)
 	endif
-	LDFLAGS += -dynamiclib -undefined dynamic_lookup -headerpad_max_install_names -mmacosx-version-min=$(MACOS_MIN_VERSION)
+	LDFLAGS += -dynamiclib -undefined dynamic_lookup -headerpad_max_install_names -mmacosx-version-min=$(MACOS_MIN_VERSION) -Wl,-dead_strip
 	CFLAGS += -mmacosx-version-min=$(MACOS_MIN_VERSION)
 	CARGO_ENV += MACOSX_DEPLOYMENT_TARGET=$(MACOS_MIN_VERSION)
 	CARGO = $(CARGO_ENV) cargo
 	STRIP = strip -x -S -r $@
 	LIBS = -lmcp_ffi -framework CoreFoundation -framework Security -lresolv
 	T_LIBS = -lpthread -ldl -lm
+	RUSTFLAGS = -C opt-level=z -C lto=fat -C codegen-units=1 -C strip=symbols
 else ifeq ($(PLATFORM),android)
 	ifndef ARCH
 		$(error "Android ARCH must be set to ARCH=x86_64 or ARCH=arm64-v8a")
@@ -98,34 +100,38 @@ else ifeq ($(PLATFORM),android)
 	CC = $(BIN)/$(ARCH)-linux-$(ANDROID_ABI)-clang
 	OPENSSL = $(OPENSSL_INSTALL_DIR)/lib/libssl.a
 	TARGET := $(DIST_DIR)/mcp.so
-	LDFLAGS += -shared -L$(OPENSSL_INSTALL_DIR)/lib
+	LDFLAGS += -shared -L$(OPENSSL_INSTALL_DIR)/lib -Wl,--gc-sections
 	CFLAGS += -fPIC -I$(OPENSSL_INSTALL_DIR)/include
 	STRIP = $(BIN)/llvm-strip --strip-unneeded $@
 	LIBS = -lmcp_ffi -ldl -lm -lssl -lcrypto
 	T_LIBS = -ldl -lm
+	RUSTFLAGS = -C opt-level=z -C codegen-units=1 -C strip=symbols
 else ifeq ($(PLATFORM),ios)
 	TARGET := $(DIST_DIR)/mcp.dylib
 	SDK := -isysroot $(shell xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=11.0
-	LDFLAGS += -dynamiclib $(SDK) -headerpad_max_install_names
+	LDFLAGS += -dynamiclib $(SDK) -headerpad_max_install_names -Wl,-dead_strip
 	CFLAGS += -arch arm64 $(SDK)
 	STRIP = strip -x -S $@
 	LIBS = -lmcp_ffi -framework CoreFoundation -framework Security -lSystem -lresolv
 	T_LIBS = -lpthread -ldl -lm
+	RUSTFLAGS = -C opt-level=z -C lto=fat -C codegen-units=1 -C strip=symbols
 else ifeq ($(PLATFORM),ios-sim)
 	TARGET := $(DIST_DIR)/mcp.dylib
 	SDK := -isysroot $(shell xcrun --sdk iphonesimulator --show-sdk-path) -miphonesimulator-version-min=11.0
-	LDFLAGS += -arch x86_64 -arch arm64 -dynamiclib $(SDK) -headerpad_max_install_names
+	LDFLAGS += -arch x86_64 -arch arm64 -dynamiclib $(SDK) -headerpad_max_install_names -Wl,-dead_strip
 	CFLAGS += -arch x86_64 -arch arm64 $(SDK)
 	STRIP = strip -x -S $@
 	LIBS = -lmcp_ffi -framework CoreFoundation -framework Security -lSystem -lresolv
 	T_LIBS = -lpthread -ldl -lm
+	RUSTFLAGS = -C opt-level=z -C lto=fat -C codegen-units=1 -C strip=symbols
 else # linux
 	TARGET := $(DIST_DIR)/mcp.so
-	LDFLAGS += -shared
+	LDFLAGS += -shared -Wl,--gc-sections
 	CFLAGS += -fPIC
 	STRIP = strip --strip-unneeded $@
 	LIBS = -lmcp_ffi -lpthread -ldl -lm -lssl -lcrypto
 	T_LIBS = -lpthread -ldl -lm
+	RUSTFLAGS = -C opt-level=z -C codegen-units=1 -C strip=symbols
 endif
 
 # Windows .def file generation
