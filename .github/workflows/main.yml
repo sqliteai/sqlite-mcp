@@ -209,6 +209,7 @@ jobs:
       - name: run mcp test server
         if: ( matrix.name == 'android' && matrix.arch == 'x86_64' ) || matrix.name == 'linux' || ( matrix.name == 'linux-musl' && matrix.arch == 'arm64' ) || matrix.name == 'windows' || ( matrix.name == 'macos' && matrix.arch != 'x86_64' )
         run: |
+          ${{ matrix.name == 'linux' && matrix.arch == 'arm64' && 'npx playwright install chrome' || '' }} \
           ${{ matrix.name == 'linux-musl' && matrix.arch == 'arm64' && 'docker exec alpine' || '' }} \
           npx @playwright/mcp@latest --port 8931 --headless & sleep 10
 
