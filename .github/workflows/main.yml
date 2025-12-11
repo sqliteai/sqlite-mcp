@@ -208,9 +208,7 @@ jobs:
 
       - name: run mcp test server
         if: ( matrix.name == 'android' && matrix.arch == 'x86_64' ) || ( matrix.name == 'linux' && matrix.arch == 'x86_64' ) || matrix.name == 'windows' || ( matrix.name == 'macos' && matrix.arch != 'x86_64' )
-        run: |
-          ${{ matrix.name == 'linux-musl' && matrix.arch == 'arm64' && 'docker exec alpine' || '' }} \
-          npx @playwright/mcp@latest --port 8931 --headless & sleep 10
+        run: npx @playwright/mcp@latest --port 8931 --headless & sleep 10
 
       - name: android test sqlite-mcp
         if: matrix.name == 'android' && matrix.arch != 'arm64-v8a' && matrix.arch != 'armeabi-v7a'
@@ -228,7 +226,7 @@ jobs:
 
       - name: load test only sqlite-mcp
         if: matrix.name == 'linux-musl' || ( matrix.name == 'linux' && matrix.arch == 'arm64' )
-        run: sqlite3 ":memory:" -cmd ".bail on" ".load ./dist/mcp" "SELECT mcp_version();"
+        run: ${{ matrix.name == 'linux-musl' && matrix.arch == 'arm64' && 'docker exec alpine' || '' }} sqlite3 ":memory:" -cmd ".bail on" ".load ./dist/mcp" "SELECT mcp_version();"
 
       - name: test sqlite-mcp
         if: ( matrix.name == 'linux' && matrix.arch == 'x86_64' ) || matrix.name == 'windows' || ( matrix.name == 'macos' && matrix.arch != 'x86_64' )
