@@ -55,6 +55,12 @@ void mcp_client_free(McpClient* client);
  */
 char* mcp_connect(McpClient* client, const char* server_url, const char* headers_json, int32_t legacy_sse);
 
+/**
+ * Disconnect from MCP server and reset global client state
+ * Returns: NULL on success
+ */
+char* mcp_disconnect(void);
+
 #ifdef __cplusplus
 }
 #endif

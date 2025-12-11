@@ -63,11 +63,6 @@ SELECT mcp_connect(
 );
 ```
 
-**Response:**
-```json
-{"status": "connected", "transport": "streamable_http"}
-```
-
 See [USAGE.md](USAGE.md) for more examples of using custom headers.
 
 ---
@@ -423,10 +418,31 @@ SELECT mcp_connect('http://localhost:8931/sse', NULL, 1);
 
 ## Error Handling
 
-All functions return JSON with error information on failure:
+The sqlite-mcp extension has two types of error handling:
+
+1. **JSON Functions** (ending with `_json`): Return JSON with error information
+2. **Non-JSON Functions**: Return error strings directly (extracted from JSON)
+3. **Virtual Tables**: Return no rows on error, use scalar functions to check status
+
+### mcp_connect()
+
+Returns `NULL` on success, or an error string on failure:
+
+```sql
+-- Check if connection succeeded
+SELECT mcp_connect('http://localhost:8000/mcp') IS NULL;
+-- Returns 1 (true) on success, 0 (false) on failure
+
+-- Get error message if connection failed
+SELECT mcp_connect('http://invalid:8000/mcp');
+-- Returns: "Failed to connect to MCP server: ..."
+```
+
+### JSON Functions: mcp_list_tools_json() and mcp_call_tool_json()
+
+Always return JSON - either with results or error information:
 
 ```json
-{"error": "Connection failed: timeout"}
 {"error": "Not connected. Call mcp_connect() first"}
 {"error": "Tool not found: invalid_tool"}
 {"error": "Invalid JSON arguments"}
@@ -442,4 +458,74 @@ SELECT
     ELSE 'Success'
   END
 FROM (SELECT mcp_call_tool_json('test', '{}') as result);
+```
+
+### Virtual Tables: mcp_list_tools, mcp_call_tool, mcp_list_tools_respond, mcp_call_tool_respond
+
+Virtual tables return no rows on error. To check for errors, use the corresponding JSON functions:
+
+```sql
+-- Check if server is connected before querying virtual table
+SELECT 
+  CASE 
+    WHEN json_extract(mcp_list_tools_json(), '$.error') IS NOT NULL
+    THEN 'Error: Cannot query virtual table - ' || json_extract(mcp_list_tools_json(), '$.error')
+    ELSE 'OK to query virtual table'
+  END;
+
+-- Query virtual table only if no error
+SELECT name, description FROM mcp_list_tools WHERE name LIKE 'browser_%';
+```
+
+### Common Error Messages
+
+All functions may return these error types:
+
+- **Connection errors**: `"Not connected. Call mcp_connect() first"`
+- **Server errors**: `"Failed to connect to MCP server: ..."`
+- **Tool errors**: `"Tool not found: tool_name"`
+- **Argument errors**: `"Invalid JSON arguments"`
+- **Transport errors**: `"Transport error: ..."`
+- **Timeout errors**: `"Request timeout"`
+
+### Error Handling Best Practices
+
+1. **Always check mcp_connect() result**:
+```sql
+-- Good practice: Check connection first
+SELECT 
+  CASE 
+    WHEN mcp_connect('http://localhost:8931/mcp') IS NULL 
+    THEN 'Connected successfully'
+    ELSE mcp_connect('http://localhost:8931/mcp')
+  END;
+```
+
+2. **Use JSON functions for error checking before virtual tables**:
+```sql
+-- Check for errors before using virtual table
+WITH error_check AS (
+  SELECT json_extract(mcp_list_tools_json(), '$.error') as error
+)
+SELECT 
+  CASE 
+    WHEN error_check.error IS NOT NULL 
+    THEN 'Error: ' || error_check.error
+    ELSE 'Tools: ' || (SELECT GROUP_CONCAT(name) FROM mcp_list_tools)
+  END
+FROM error_check;
+```
+
+3. **Handle tool call errors**:
+```sql
+-- Safe tool calling with error handling
+SELECT 
+  CASE 
+    WHEN json_extract(result, '$.error') IS NOT NULL
+    THEN 'Tool Error: ' || json_extract(result, '$.error')
+    ELSE json_extract(result, '$.content[0].text') 
+  END as output
+FROM (
+  SELECT mcp_call_tool_json('browser_navigate', '{"url": "https://example.com"}') as result
+);
 ```

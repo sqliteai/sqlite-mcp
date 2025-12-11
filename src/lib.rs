@@ -13,9 +13,25 @@ use std::sync::{Mutex, OnceLock};
 use rmcp::transport::{SseClientTransport, StreamableHttpClientTransport};
 use rmcp::{ServiceExt, RoleClient};
 use rmcp::model::{ClientInfo, ClientCapabilities, Implementation};
+use serde_json;
 
 // Global client instance - one client per process
 static GLOBAL_CLIENT: OnceLock<Mutex<Option<McpClient>>> = OnceLock::new();
+
+/// Extract error message from JSON error response
+/// Returns the error message string if found, or the original JSON if not found
+fn extract_error_message(json_str: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(json_str) {
+        Ok(json) => {
+            if let Some(error) = json.get("error").and_then(|e| e.as_str()) {
+                error.to_string()
+            } else {
+                json_str.to_string()
+            }
+        }
+        Err(_) => json_str.to_string(),
+    }
+}
 
 /// Initialize the MCP library
 /// Returns 0 on success, non-zero on error
@@ -538,28 +554,53 @@ pub extern "C" fn mcp_connect(
                     // Return NULL on successful connection
                     ptr::null_mut()
                 } else {
-                    // Return error if status is not "connected"
-                    match CString::new(result) {
+                    // Return error string (extracted from JSON)
+                    let error_msg = extract_error_message(&result);
+                    match CString::new(error_msg) {
                         Ok(c_str) => c_str.into_raw(),
                         Err(_) => ptr::null_mut(),
                     }
                 }
             } else {
-                // No status field found, return as error
-                match CString::new(result) {
+                // No status field found, extract error message
+                let error_msg = extract_error_message(&result);
+                match CString::new(error_msg) {
                     Ok(c_str) => c_str.into_raw(),
                     Err(_) => ptr::null_mut(),
                 }
             }
         }
         Err(_) => {
-            // Invalid JSON, return as error
-            match CString::new(result) {
+            // Invalid JSON, return as error string
+            let error_msg = extract_error_message(&result);
+            match CString::new(error_msg) {
                 Ok(c_str) => c_str.into_raw(),
                 Err(_) => ptr::null_mut(),
             }
         }
     }
+}
+
+/// Disconnect from MCP server and reset global client state
+/// Returns NULL on success
+#[no_mangle]
+pub extern "C" fn mcp_disconnect() -> *mut c_char {
+    let global_client = GLOBAL_CLIENT.get_or_init(|| Mutex::new(None));
+    *global_client.lock().unwrap() = None;
+    
+    // Also clear any active stream channels
+    {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut channels = STREAM_CHANNELS.lock().await;
+            channels.clear();
+        });
+    }
+    
+    // Reset stream counter
+    *STREAM_COUNTER.lock().unwrap() = 0;
+    
+    ptr::null_mut()
 }
 
 /// List tools available on the connected MCP server (returns raw JSON)

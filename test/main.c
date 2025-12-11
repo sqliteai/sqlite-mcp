@@ -1067,7 +1067,7 @@ int test_mcp_call_tool_streaming(sqlite3 *db) {
     // Step 1: Connect to MCP server first
     printf("    [1/3] Connecting to MCP server...\n");
     rc = sqlite3_prepare_v2(db,
-        "SELECT mcp_connect('http://localhost:8931/sse', NULL, 1)",
+        "SELECT mcp_connect('http://localhost:8931/mcp')",
         -1, &stmt, 0);
     if (rc != SQLITE_OK) {
         fprintf(stderr, "    Failed to prepare connect: %s\n", sqlite3_errmsg(db));
@@ -1079,7 +1079,15 @@ int test_mcp_call_tool_streaming(sqlite3 *db) {
         sqlite3_finalize(stmt);
         return 1;
     }
+    
+    const unsigned char *connect_result = sqlite3_column_text(stmt, 0);
     sqlite3_finalize(stmt);
+    
+    if (connect_result != NULL) {
+        fprintf(stderr, "    Connection failed: %s\n", connect_result);
+        return 1;
+    }
+    
     printf("    ✓ Connected\n");
 
     // Step 2: Query streaming virtual table using function-style syntax
@@ -1251,6 +1259,298 @@ int test_error_call_before_connect(sqlite3 *db) {
     return 1;
 }
 
+// Test error handling for invalid connection URL
+int test_error_invalid_url(sqlite3 *db) {
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT mcp_connect('http://invalid-host:9999/mcp')",
+        -1, &stmt, 0);
+
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        fprintf(stderr, "    Failed to execute: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+
+    const unsigned char *result = sqlite3_column_text(stmt, 0);
+    if (!result) {
+        fprintf(stderr, "    Result is NULL\n");
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+
+    // Should get an error string (not JSON)
+    if (strstr((const char *)result, "Failed to connect") != NULL || 
+        strstr((const char *)result, "Connection") != NULL) {
+        printf("    ✓ Returns error string: %s\n", result);
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+
+    fprintf(stderr, "    Expected connection error but got: %s\n", result);
+    sqlite3_finalize(stmt);
+    return 1;
+}
+
+// Test error handling for malformed URL
+int test_error_malformed_url(sqlite3 *db) {
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT mcp_connect('not-a-url')",
+        -1, &stmt, 0);
+
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        fprintf(stderr, "    Failed to execute: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+
+    const unsigned char *result = sqlite3_column_text(stmt, 0);
+    if (!result) {
+        fprintf(stderr, "    Result is NULL\n");
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+
+    // Should get an error string
+    if (strstr((const char *)result, "error") != NULL || 
+        strstr((const char *)result, "Invalid") != NULL ||
+        strstr((const char *)result, "Failed") != NULL) {
+        printf("    ✓ Returns error for malformed URL: %s\n", result);
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+
+    fprintf(stderr, "    Expected URL error but got: %s\n", result);
+    sqlite3_finalize(stmt);
+    return 1;
+}
+
+// Test that virtual tables return no results (not errors) when not connected
+int test_error_virtual_tables_not_connected(sqlite3 *db) {
+    // First ensure we're disconnected
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(db, "SELECT mcp_disconnect()", -1, &stmt, 0);
+    if (rc == SQLITE_OK) {
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    }
+
+    const char *queries[] = {
+        "SELECT COUNT(*) FROM mcp_list_tools",
+        "SELECT COUNT(*) FROM mcp_list_tools_respond"
+    };
+    int num_queries = sizeof(queries) / sizeof(queries[0]);
+
+    for (int i = 0; i < num_queries; i++) {
+        printf("    [%d/%d] Testing: %s\n", i+1, num_queries, queries[i]);
+        
+        rc = sqlite3_prepare_v2(db, queries[i], -1, &stmt, 0);
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "    Failed to prepare: %s\n", sqlite3_errmsg(db));
+            return 1;
+        }
+
+        rc = sqlite3_step(stmt);
+        if (rc != SQLITE_ROW) {
+            fprintf(stderr, "    Failed to execute: %s\n", sqlite3_errmsg(db));
+            sqlite3_finalize(stmt);
+            return 1;
+        }
+
+        int count = sqlite3_column_int(stmt, 0);
+        sqlite3_finalize(stmt);
+        
+        if (count == 0) {
+            printf("    ✓ Virtual table correctly returns 0 rows when not connected\n");
+        } else {
+            fprintf(stderr, "    Expected 0 rows but got %d\n", count);
+            return 1;
+        }
+    }
+
+    // Test function-style virtual tables that should return no rows when not connected
+    const char *function_queries[] = {
+        "SELECT COUNT(*) FROM mcp_call_tool('test', '{}')",
+        "SELECT COUNT(*) FROM mcp_call_tool_respond('test', '{}')"
+    };
+    int num_function_queries = sizeof(function_queries) / sizeof(function_queries[0]);
+
+    for (int i = 0; i < num_function_queries; i++) {
+        printf("    [%d/%d] Testing function-style: %s\n", i+3, num_queries+num_function_queries, function_queries[i]);
+        
+        rc = sqlite3_prepare_v2(db, function_queries[i], -1, &stmt, 0);
+        if (rc != SQLITE_OK) {
+            printf("    ✓ Function-style query failed as expected (not connected): %s\n", sqlite3_errmsg(db));
+            continue;
+        }
+
+        rc = sqlite3_step(stmt);
+        if (rc == SQLITE_ROW) {
+            int count = sqlite3_column_int(stmt, 0);
+            if (count == 0) {
+                printf("    ✓ Function-style virtual table correctly returns 0 rows when not connected\n");
+            } else {
+                fprintf(stderr, "    Expected 0 rows but got %d\n", count);
+                sqlite3_finalize(stmt);
+                return 1;
+            }
+        } else {
+            printf("    ✓ Function-style query failed as expected (not connected)\n");
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    return 0;
+}
+
+// Test error handling for invalid tool calls
+int test_error_invalid_tool_calls(sqlite3 *db) {
+    // First connect to server
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT mcp_connect('http://localhost:8931/mcp')",
+        -1, &stmt, 0);
+
+    if (rc != SQLITE_OK) {
+        printf("    Skipping test - can't prepare connect statement\n");
+        return 0; // Skip if server not available
+    }
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        printf("    Skipping test - MCP server not available\n");
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+
+    const unsigned char *connect_result = sqlite3_column_text(stmt, 0);
+    sqlite3_finalize(stmt);
+
+    if (connect_result != NULL) {
+        printf("    Skipping test - connection failed\n");
+        return 0;
+    }
+
+    printf("    ✓ Connected to MCP server\n");
+
+    // Test invalid tool name
+    rc = sqlite3_prepare_v2(db,
+        "SELECT mcp_call_tool_json('nonexistent_tool', '{}')",
+        -1, &stmt, 0);
+
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare invalid tool test: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        fprintf(stderr, "    Failed to execute invalid tool test: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+
+    // Get the result and copy it to avoid memory issues
+    const unsigned char *result_raw = sqlite3_column_text(stmt, 0);
+    int result_len = sqlite3_column_bytes(stmt, 0);
+    
+    if (!result_raw) {
+        fprintf(stderr, "    Invalid tool result is NULL\n");
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+
+    // Copy the result to our own buffer
+    char *result = malloc(result_len + 1);
+    memcpy(result, result_raw, result_len);
+    result[result_len] = '\0';
+    
+    sqlite3_finalize(stmt);
+
+    // Check if result is valid
+    if (result_len == 0) {
+        fprintf(stderr, "    Invalid tool result is empty\n");
+        free(result);
+        return 1;
+    }
+
+    // Should get a JSON response with "result" or "error"
+    if ((strstr(result, "result") != NULL || strstr(result, "error") != NULL) && 
+        strstr(result, "{") != NULL) {
+        printf("    ✓ Returns JSON response for invalid tool: %.100s%s\n", 
+               result, result_len > 100 ? "..." : "");
+    } else {
+        fprintf(stderr, "    Expected JSON response for invalid tool but got (%d bytes): %.50s%s\n", 
+                result_len, result, result_len > 50 ? "..." : "");
+        free(result);
+        return 1;
+    }
+    
+    free(result);
+
+    // Test invalid JSON arguments
+    rc = sqlite3_prepare_v2(db,
+        "SELECT mcp_call_tool_json('browser_navigate', 'not-valid-json')",
+        -1, &stmt, 0);
+
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare invalid JSON test: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        fprintf(stderr, "    Failed to execute invalid JSON test: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+
+    // Get the result and copy it to avoid memory issues
+    const unsigned char *result_raw2 = sqlite3_column_text(stmt, 0);
+    int result_len2 = sqlite3_column_bytes(stmt, 0);
+    
+    if (!result_raw2) {
+        fprintf(stderr, "    Invalid JSON result is NULL\n");
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+
+    // Copy the result to our own buffer
+    char *result2 = malloc(result_len2 + 1);
+    memcpy(result2, result_raw2, result_len2);
+    result2[result_len2] = '\0';
+    
+    sqlite3_finalize(stmt);
+
+    // Should get an error in JSON format
+    if ((strstr(result2, "error") != NULL || strstr(result2, "result") != NULL) && 
+        strstr(result2, "{") != NULL) {
+        printf("    ✓ Returns JSON response for invalid JSON: %.100s%s\n", 
+               result2, result_len2 > 100 ? "..." : "");
+    } else {
+        fprintf(stderr, "    Expected JSON response for invalid JSON but got (%d bytes): %.50s%s\n", 
+                result_len2, result2, result_len2 > 50 ? "..." : "");
+        free(result2);
+        return 1;
+    }
+
+    free(result2);
+    return 0;
+}
+
 int main(void) {
     printf("\n=== sqlite-mcp Test Suite ===\n\n");
 
@@ -1273,6 +1573,10 @@ int main(void) {
     // Test error cases
     printf("\n--- Error Case Tests ---\n");
     run_test("Error: calling tool before connect", test_error_call_before_connect);
+    run_test("Error: invalid connection URL", test_error_invalid_url);
+    run_test("Error: malformed URL", test_error_malformed_url);
+    run_test("Error: virtual tables when not connected", test_error_virtual_tables_not_connected);
+    run_test("Error: invalid tool calls", test_error_invalid_tool_calls);
 
     // Standard MCP tests
     printf("\n--- Standard MCP Operations ---\n");

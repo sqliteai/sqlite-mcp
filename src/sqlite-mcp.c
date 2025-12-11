@@ -93,6 +93,27 @@ static void mcp_connect_func(
   mcp_free_string(result);
 }
 
+static void mcp_disconnect_func(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  if (argc != 0) {
+    sqlite3_result_error(context, "mcp_disconnect takes no arguments", -1);
+    return;
+  }
+
+  char *result = mcp_disconnect();
+  
+  // Should always return NULL (success)
+  if (!result) {
+    sqlite3_result_null(context);
+  } else {
+    sqlite3_result_text(context, result, -1, SQLITE_TRANSIENT);
+    mcp_free_string(result);
+  }
+}
+
 /*
 ** STREAMING Virtual Table for mcp_list_tools
 ** Returns parsed tool information as rows using streaming API
@@ -1258,6 +1279,11 @@ int sqlite3_mcp_init(
   rc = sqlite3_create_function(db, "mcp_connect", -1,
                                SQLITE_UTF8,
                                0, mcp_connect_func, 0, 0);
+  if (rc != SQLITE_OK) return rc;
+
+  rc = sqlite3_create_function(db, "mcp_disconnect", 0,
+                               SQLITE_UTF8,
+                               0, mcp_disconnect_func, 0, 0);
   if (rc != SQLITE_OK) return rc;
 
   // Scalar functions that return JSON strings
