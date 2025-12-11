@@ -40,17 +40,6 @@ pub extern "C" fn mcp_init() -> i32 {
     0
 }
 
-/// Get the version string of the MCP library
-/// Returns a null-terminated string that must be freed with mcp_free_string
-#[no_mangle]
-pub extern "C" fn mcp_get_version() -> *mut c_char {
-    let version = env!("CARGO_PKG_VERSION");
-    match CString::new(version) {
-        Ok(c_str) => c_str.into_raw(),
-        Err(_) => ptr::null_mut(),
-    }
-}
-
 /// Free a string allocated by the MCP library
 #[no_mangle]
 pub extern "C" fn mcp_free_string(s: *mut c_char) {

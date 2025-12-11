@@ -24,12 +24,6 @@ typedef struct McpClient McpClient;
 int32_t mcp_init(void);
 
 /**
- * Get the version string of the MCP library
- * Returns a null-terminated string that must be freed with mcp_free_string
- */
-char* mcp_get_version(void);
-
-/**
  * Free a string allocated by the MCP library
  */
 void mcp_free_string(char* s);

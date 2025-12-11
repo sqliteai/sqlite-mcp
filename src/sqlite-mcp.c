@@ -39,13 +39,7 @@ static void mcp_version_func(
   int argc,
   sqlite3_value **argv
 ){
-  char *version = mcp_get_version();
-  if (version) {
-    sqlite3_result_text(context, version, -1, SQLITE_TRANSIENT);
-    mcp_free_string(version);
-  } else {
-    sqlite3_result_error(context, "Failed to get MCP version", -1);
-  }
+  sqlite3_result_text(context, SQLITE_MCP_VERSION, -1, NULL);
 }
 
 /*
