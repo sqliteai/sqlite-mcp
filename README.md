@@ -25,11 +25,11 @@ SELECT mcp_connect('http://localhost:8000/mcp');
 -- {"status": "connected", "transport": "streamable_http"}
 
 -- List available tools
-SELECT mcp_list_tools();
+SELECT mcp_list_tools_json();
 -- Returns JSON with tool schemas
 
 -- Call a tool
-SELECT mcp_call_tool('airbnb_search', '{"location": "Rome", "maxPrice": 100}');
+SELECT mcp_call_tool_json('airbnb_search', '{"location": "Rome", "maxPrice": 100}');
 -- Returns search results
 ```
 
@@ -40,11 +40,13 @@ SELECT mcp_call_tool('airbnb_search', '{"location": "Rome", "maxPrice": 100}');
 | Function | Description |
 |----------|-------------|
 | `mcp_version()` | Returns extension version |
-| `mcp_connect(url, [sse], [headers], [use_json_ext])` | Connect to MCP server with optional custom headers and JSON extension mode |
-| `mcp_list_tools()` | List available tools with schemas |
-| `mcp_call_tool(name, args)` | Call a tool on the MCP server |
-| `mcp_tools_table` | Virtual table that returns each tool as a row with structured columns |
-| `mcp_call_tool_table` | Virtual table that extracts text results from tool calls |
+| `mcp_connect(url, [headers], [sse])` | Connect to MCP server with optional custom headers |
+| `mcp_list_tools_json()` | List available tools with schemas |
+| `mcp_call_tool_json(name, args)` | Call a tool on the MCP server |
+| `mcp_list_tools_respond` | Virtual table (cached) that returns each tool as a row with structured columns |
+| `mcp_call_tool_respond(name, args)` | Virtual table that extracts text results from tool calls |
+| `mcp_list_tools` | Streaming virtual table that returns tools as they arrive |
+| `mcp_call_tool(name, args)` | Streaming virtual table for real-time tool results |
 
 See [API.md](API.md) for complete API documentation with examples.
 
@@ -112,7 +114,7 @@ int main() {
 
     // Call tool
     sqlite3_prepare_v2(db,
-        "SELECT mcp_call_tool('airbnb_search', '{\"location\": \"NYC\"}')",
+        "SELECT mcp_call_tool_json('airbnb_search', '{\"location\": \"NYC\"}')",
         -1, &stmt, NULL);
     if (sqlite3_step(stmt) == SQLITE_ROW) {
         printf("Result: %s\n", sqlite3_column_text(stmt, 0));

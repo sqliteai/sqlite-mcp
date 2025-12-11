@@ -29,10 +29,10 @@ jobs:
             arch: x86_64
             name: linux
 
-          # Linux ARM64 (to enable when the repo will be public)
-          #- os: ubuntu-22.04-arm
-          #  arch: arm64
-          #  name: linux
+          # Linux ARM64
+          - os: ubuntu-22.04-arm
+            arch: arm64
+            name: linux
 
           # Linux musl x86_64
           - os: ubuntu-22.04
@@ -40,10 +40,10 @@ jobs:
             name: linux-musl
             container: alpine:latest
 
-          # Linux musl ARM64 (to enable when the repo will be public)
-          #- os: ubuntu-22.04-arm
-          #  arch: arm64
-          #  name: linux-musl
+          # Linux musl ARM64
+          - os: ubuntu-22.04-arm
+            arch: arm64
+            name: linux-musl
 
           # macOS universal binary (x86_64 + arm64)
           - os: macos-15

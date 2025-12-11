@@ -8,6 +8,7 @@ rmcp = { path = "modules/mcp/crates/rmcp", features = ["client", "transport-sse-
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"], default-features = false }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+lazy_static = "1.5"
 
 [lib]
 name = "mcp_ffi"

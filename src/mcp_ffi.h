@@ -55,24 +55,6 @@ void mcp_client_free(McpClient* client);
  */
 char* mcp_connect(McpClient* client, const char* server_url, const char* headers_json, int32_t legacy_sse);
 
-/**
- * List tools available on the connected MCP server
- * Returns: JSON string with tools list (must be freed with mcp_free_string)
- */
-char* mcp_list_tools(McpClient* client);
-
-/**
- * Call a tool on the connected MCP server
- * tool_name: Name of the tool to call
- * arguments_json: JSON string with tool arguments
- * Returns: JSON string with tool result (must be freed with mcp_free_string)
- */
-char* mcp_call_tool(McpClient* client, const char* tool_name, const char* arguments_json);
-
-/* Backwards compatibility aliases */
-#define mcp_context_new mcp_client_new
-#define mcp_context_free mcp_client_free
-
 #ifdef __cplusplus
 }
 #endif

@@ -6,17 +6,16 @@ The SQLite MCP extension supports connecting to MCP servers with optional custom
 
 ## SQL Function
 
-### `mcp_connect(server_url, [legacy_sse], [headers_json], [use_json_ext])`
+### `mcp_connect(server_url, [headers_json], [legacy_sse])`
 
-Connect to an MCP server with optional custom headers and JSON extension mode.
+Connect to an MCP server with optional custom headers.
 
 **Parameters:**
 - `server_url` (required): URL of the MCP server (e.g., "http://localhost:8000/mcp")
-- `legacy_sse` (optional): Transport type - 0 for streamable HTTP (default), 1 for SSE
 - `headers_json` (optional): JSON string with custom headers (e.g., `{"Authorization": "Bearer token", "X-MCP-Readonly": "true"}`)
-- `use_json_ext` (optional): JSON extension mode - 0 for regular text (default), 1 to return results as JSON type
+- `legacy_sse` (optional): Transport type - 0 for streamable HTTP (default), 1 for SSE
 
-**Returns:** JSON string with connection status (or JSON object if `use_json_ext` is enabled)
+**Returns:** JSON string with connection status
 
 ## SQL Examples
 
@@ -45,11 +44,11 @@ SELECT mcp_connect(
 ### Connect Without Authentication
 
 ```sql
--- No auth needed - just omit the third parameter
+-- No auth needed 
 SELECT mcp_connect('http://localhost:8000/mcp');
 
--- Or explicitly specify transport
-SELECT mcp_connect('http://localhost:8000/mcp', 0);
+-- Or explicitly specify parameters
+SELECT mcp_connect('http://localhost:8000/mcp', NULL, 0);
 ```
 
 ## Security Best Practices
@@ -88,104 +87,38 @@ When passing to SQL, escape quotes properly:
 SELECT mcp_connect('http://localhost:8000/mcp', 0, '{"Authorization": "Bearer token"}');
 ```
 
-## Using JSON Extension Mode
-
-The 4th parameter `use_json_ext` enables SQLite's JSON extension mode for all MCP results:
-
-```sql
--- Enable JSON extension mode (4th parameter = 1)
-SELECT mcp_connect('http://localhost:8000/mcp', 0, NULL, 1);
-
--- With custom headers AND JSON extension mode
-SELECT mcp_connect(
-    'https://api.githubcopilot.com/mcp/',
-    0,
-    '{"Authorization": "Bearer ghp_token"}',
-    1
-);
-```
-
-### JSON Extension Benefits
-
-When JSON extension mode is enabled:
-- Direct use of `json_extract()` without wrapping in `json()`
-- Better type safety and performance
-- Seamless integration with SQLite JSON functions
-
-### JSON Extension Examples
-
-```sql
--- Connect with JSON extension mode
-SELECT mcp_connect('http://localhost:8000/mcp', 0, NULL, 1);
-
--- Extract specific fields from connection result
-SELECT json_extract(
-  mcp_connect('http://localhost:8000/mcp', 0, NULL, 1),
-  '$.status'
-) as connection_status;
-
--- List all tools with json_each
-SELECT
-  json_extract(value, '$.name') as tool_name,
-  json_extract(value, '$.description') as description
-FROM json_each((SELECT mcp_list_tools()), '$.tools');
-
--- Extract tool result
-SELECT json_extract(
-  mcp_call_tool('search', '{"query": "test"}'),
-  '$.result.content[0].text'
-) as result;
-```
-
-## Using Virtual Tables
-
-Virtual tables provide a simpler way to work with MCP data by automatically parsing JSON into structured rows.
-
-### How Virtual Tables Work
-
-Virtual tables **always** extract and parse the JSON response using SQLite's `json_each()` function, regardless of whether JSON extension mode is enabled:
-
-- `mcp_tools_table` - Extracts the `$.tools` array and returns each tool as a row with columns: name, title, description, inputSchema, outputSchema, annotations
-- `mcp_call_tool_table` - Extracts the `$.result.content` array and returns each `type="text"` item as a row
-
-The JSON extension mode setting only affects **scalar functions** (like `mcp_list_tools()` and `mcp_call_tool()`), which return the complete JSON response with or without the JSON subtype.
-
 ### Query Tools as Rows
 
-Instead of manually parsing JSON with `json_each()`, use the `mcp_tools_table` virtual table:
+Instead of manually parsing JSON with `json_each()`, use the `mcp_list_tools_respond` virtual table:
 
 ```sql
 -- Connect first
 SELECT mcp_connect('http://localhost:8000/mcp');
 
 -- Get all tools as rows
-SELECT name, description FROM mcp_tools_table;
+SELECT name, description FROM mcp_list_tools_respond;
 
 -- Filter tools
 SELECT name, description
-FROM mcp_tools_table
+FROM mcp_list_tools_respond
 WHERE name LIKE 'search%';
 
 -- Extract inputSchema for a specific tool
 SELECT name, inputSchema
-FROM mcp_tools_table
+FROM mcp_list_tools_respond
 WHERE name = 'airbnb_search';
 ```
 
 ### Get Tool Results as Rows
 
-The `mcp_call_tool_table` virtual table extracts text results automatically from the `result.content` array:
+The `mcp_call_tool_respond` virtual table extracts text results automatically from the `result.content` array:
 
 ```sql
 -- Call a tool and get text results
-SELECT text FROM mcp_call_tool_table
-WHERE tool_name = 'search'
-AND arguments = '{"query": "SQLite"}';
+SELECT text FROM mcp_call_tool_respond('search', '{"query": "SQLite"}');
 
 -- Multiple text results become multiple rows
-SELECT text FROM mcp_call_tool_table
-WHERE tool_name = 'analyze_data'
-AND arguments = '{"dataset": "sales"}';
+SELECT text FROM mcp_call_tool_respond('analyze_data', '{"dataset": "sales"}');
 ```
 
 **Expected result structure from MCP:**
@@ -200,18 +133,55 @@ AND arguments = '{"dataset": "sales"}';
 }
 ```
 
+### Stream Tool Results in Real-Time
+
+The `mcp_call_tool` virtual table provides streaming access to tool results, delivering text chunks as they arrive instead of waiting for the complete response. This is ideal for long-running operations or when you need immediate feedback.
+
+**Basic streaming syntax:**
+```sql
+-- Stream results from a tool call
+SELECT text FROM mcp_call_tool('browser_navigate', '{"url": "https://sqlite.ai"}');
+
+-- Stream search results
+SELECT text FROM mcp_call_tool('search', '{"query": "SQLite MCP"}');
+```
+
+**When to use streaming:**
+- Long-running tool operations (web scraping, large data processing)
+- Real-time feedback needed (progress updates, partial results)
+- Memory-efficient processing of large responses
+- Interactive applications requiring immediate output
+
+**Comparison: Streaming vs Non-Streaming**
+
+| Feature | `mcp_call_tool` (streaming) | `mcp_call_tool_respond` (cached) |
+|---------|----------------------|---------------------|
+| Response delivery | Real-time chunks | Complete response |
+| Memory usage | Low (streaming) | Higher (full result) |
+| Use case | Long operations | Quick queries |
+| Latency | Immediate first chunk | Wait for completion |
+
+**Example - Processing large dataset:**
+```sql
+-- Streaming approach - get results as they arrive
+SELECT text FROM mcp_call_tool('analyze_logs', '{"file": "large.log"}');
+
+-- Non-streaming approach - wait for complete analysis
+SELECT text FROM mcp_call_tool_respond('analyze_logs', '{"file": "large.log"}');
+```
+
 ### Comparison: Virtual Tables vs JSON Functions
 
 **Using JSON functions (more complex):**
 ```sql
 SELECT json_extract(value, '$.name') as name
-FROM json_each((SELECT mcp_list_tools()), '$.tools')
+FROM json_each((SELECT mcp_list_tools_json()), '$.tools')
 WHERE json_extract(value, '$.name') LIKE 'search%';
 ```
 
 **Using virtual tables (simpler):**
 ```sql
-SELECT name FROM mcp_tools_table
+SELECT name FROM mcp_list_tools_respond
 WHERE name LIKE 'search%';
 ```
 

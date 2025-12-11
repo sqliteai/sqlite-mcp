@@ -27,33 +27,25 @@ sqlite> SELECT mcp_version();
 
 ---
 
-### `mcp_connect(server_url, [legacy_sse], [headers_json], [use_json_ext])`
+### `mcp_connect(server_url, [headers_json], [legacy_sse])`
 
-Connects to an MCP server using either Streamable HTTP (default) or SSE transport, with optional custom HTTP headers and JSON extension mode.
+Connects to an MCP server using either Streamable HTTP (default) or SSE transport, with optional custom HTTP headers.
 
 **Syntax:**
 ```sql
 SELECT mcp_connect(server_url);
-SELECT mcp_connect(server_url, legacy_sse);
-SELECT mcp_connect(server_url, legacy_sse, headers_json);
-SELECT mcp_connect(server_url, legacy_sse, headers_json, use_json_ext);
+SELECT mcp_connect(server_url, headers_json);
+SELECT mcp_connect(server_url, headers_json, legacy_sse);
 ```
 
 **Parameters:**
 - `server_url` (TEXT) - URL of the MCP server (e.g., "http://localhost:8000/mcp")
+- `headers_json` (TEXT, optional) - JSON string with custom HTTP headers (e.g., `{"Authorization": "Bearer token"}`) or NULL
 - `legacy_sse` (INTEGER, optional) - 1 to use SSE transport (legacy), 0 for Streamable HTTP (default)
-- `headers_json` (TEXT, optional) - JSON string with custom HTTP headers (e.g., `{"Authorization": "Bearer token"}`)
-- `use_json_ext` (INTEGER, optional) - 1 to enable JSON extension mode (returns results as JSON type), 0 for regular text mode (default)
 
 **Returns:**
-
-SQLite return codes from `sqlite3_step()`:
-- **On success**: `SQLITE_ROW`
-  - Regular mode (`use_json_ext=0`): Row contains JSON object with connection status
-  - JSON mode (`use_json_ext=1`): Row contains NULL (silent success)
-- **On failure**: `SQLITE_ERROR` - Error message set via `sqlite3_result_error()`
-
-**Note:** SQLite scalar functions always return exactly one row on success. They cannot return `SQLITE_DONE` (zero rows).
+- `NULL` on successful connection
+- Error message string on failure
 
 **Examples:**
 ```sql
@@ -61,24 +53,13 @@ SQLite return codes from `sqlite3_step()`:
 SELECT mcp_connect('http://localhost:8000/mcp');
 
 -- Connect using legacy SSE transport
-SELECT mcp_connect('http://localhost:8931/sse', 1);
+SELECT mcp_connect('http://localhost:8931/sse', NULL, 1);
 
 -- Connect with authorization header (GitHub Copilot)
 SELECT mcp_connect(
   'https://api.githubcopilot.com/mcp/',
-  0,
-  '{"Authorization": "Bearer ghp_your_token", "X-MCP-Readonly": "true"}'
-);
-
--- Connect with JSON extension mode enabled
-SELECT mcp_connect('http://localhost:8000/mcp', 0, NULL, 1);
-
--- Connect with both custom headers and JSON extension mode
-SELECT mcp_connect(
-  'http://localhost:8000/mcp',
-  0,
-  '{"Authorization": "Bearer token"}',
-  1
+  '{"Authorization": "Bearer ghp_your_token", "X-MCP-Readonly": "true"}',
+  0
 );
 ```
 
@@ -91,13 +72,13 @@ See [USAGE.md](USAGE.md) for more examples of using custom headers.
 
 ---
 
-### `mcp_list_tools()`
+### `mcp_list_tools_json()`
 
 Lists all tools available on the connected MCP server with their complete signatures.
 
 **Syntax:**
 ```sql
-SELECT mcp_list_tools();
+SELECT mcp_list_tools_json();
 ```
 
 **Returns:** `TEXT` - JSON array of tool definitions including:
@@ -109,7 +90,7 @@ SELECT mcp_list_tools();
 **Example:**
 ```sql
 sqlite> SELECT mcp_connect('http://localhost:8000/mcp');
-sqlite> SELECT mcp_list_tools();
+sqlite> SELECT mcp_list_tools_json();
 ```
 
 **Response:**
@@ -144,13 +125,13 @@ sqlite> SELECT mcp_list_tools();
 
 ---
 
-### `mcp_call_tool(tool_name, arguments_json)`
+### `mcp_call_tool_json(tool_name, arguments_json)`
 
 Calls a tool on the connected MCP server.
 
 **Syntax:**
 ```sql
-SELECT mcp_call_tool(tool_name, arguments_json);
+SELECT mcp_call_tool_json(tool_name, arguments_json);
 ```
 
 **Parameters:**
@@ -161,7 +142,7 @@ SELECT mcp_call_tool(tool_name, arguments_json);
 
 **Example:**
 ```sql
-SELECT mcp_call_tool(
+SELECT mcp_call_tool_json(
   'airbnb_search',
   '{"location": "Rome", "maxPrice": 100, "adults": 2}'
 );
@@ -184,7 +165,7 @@ SELECT mcp_call_tool(
 **Error Handling:**
 ```sql
 -- Returns error if not connected
-SELECT mcp_call_tool('test', '{}');
+SELECT mcp_call_tool_json('test', '{}');
 -- {"error": "Not connected. Call mcp_connect() first"}
 ```
 
@@ -194,15 +175,15 @@ SELECT mcp_call_tool('test', '{}');
 
 The extension provides virtual tables that automatically parse MCP responses into structured rows. These are ideal for SQL queries that need to process multiple tools or results.
 
-### `mcp_tools_table`
+### `mcp_list_tools_respond`
 
 A virtual table that returns each tool as a row with structured columns.
 
 **Syntax:**
 ```sql
-SELECT * FROM mcp_tools_table;
-SELECT name, description FROM mcp_tools_table;
-SELECT * FROM mcp_tools_table WHERE name LIKE 'airbnb%';
+SELECT * FROM mcp_list_tools_respond;
+SELECT name, description FROM mcp_list_tools_respond;
+SELECT * FROM mcp_list_tools_respond WHERE name LIKE 'airbnb%';
 ```
 
 **Columns:**
@@ -220,7 +201,7 @@ SELECT mcp_connect('http://localhost:8000/mcp');
 
 -- Query tools as rows
 SELECT name, description
-FROM mcp_tools_table
+FROM mcp_list_tools_respond
 WHERE name LIKE 'airbnb%';
 ```
 
@@ -234,27 +215,29 @@ airbnb_details    Get details for a specific listing
 
 ---
 
-### `mcp_call_tool_table`
+### `mcp_call_tool_respond`
 
 A virtual table that extracts text results from tool calls. Returns one row for each `type="text"` content item in the result.
 
 **Syntax:**
 ```sql
-SELECT text FROM mcp_call_tool_table
-WHERE tool_name = '<tool>' AND arguments = '<json>';
+SELECT text FROM mcp_call_tool_respond('<tool_name>', '<json_arguments>');
 ```
 
-**Columns:**
-- `tool_name` (TEXT, hidden) - Name of tool to call (required in WHERE clause)
-- `arguments` (TEXT, hidden) - JSON arguments for the tool (required in WHERE clause)
+**Parameters:**
+- `tool_name` (TEXT) - Name of tool to call (first function argument)
+- `arguments` (TEXT) - JSON arguments for the tool (second function argument)
+
+**Returns:**
 - `text` (TEXT) - Text content from each result item
 
 **Example:**
 ```sql
 -- Call tool and get text results as rows
-SELECT text FROM mcp_call_tool_table
-WHERE tool_name = 'airbnb_search'
-AND arguments = '{"location": "Rome", "maxPrice": 100}';
+SELECT text FROM mcp_call_tool_respond(
+  'airbnb_search',
+  '{"location": "Rome", "maxPrice": 100}'
+);
 ```
 
 **Result:**
@@ -267,9 +250,106 @@ Listing 2: Historic Studio - $95/night
 ```
 
 **Important Notes:**
-- The `tool_name` and `arguments` columns are "hidden" parameters that must be provided via the WHERE clause
-- This table automatically extracts only `type="text"` results from the MCP response
+- Uses function-style syntax with positional parameters
+- Automatically extracts only `type="text"` results from the MCP response
 - Each text item in the response becomes a separate row
+
+---
+
+### `mcp_list_tools`
+
+A streaming virtual table that returns tools as they are received from the server. Provides real-time access to tool listings.
+
+**Syntax:**
+```sql
+SELECT name, description FROM mcp_list_tools;
+```
+
+**Columns:**
+- `name` (TEXT) - Unique identifier for the tool
+- `description` (TEXT) - Human-readable description of functionality
+
+**Example:**
+```sql
+-- Connect to server
+SELECT mcp_connect('http://localhost:8000/mcp');
+
+-- Stream tools as they arrive
+SELECT name, description FROM mcp_list_tools;
+```
+
+**Result:**
+```
+name              description
+----------------  ------------------------------------------
+airbnb_search     Search for Airbnb listings with filters
+airbnb_details    Get details for a specific listing
+```
+
+**When to use:**
+- Real-time tool discovery
+- Large tool catalogs where latency matters
+- Interactive applications requiring immediate feedback
+
+**Comparison with `mcp_list_tools_respond`:**
+- `mcp_list_tools`: Streaming, delivers results immediately
+- `mcp_list_tools_respond`: Buffered, waits for complete response
+
+---
+
+### `mcp_call_tool`
+
+A streaming virtual table that returns tool results in real-time as text chunks arrive. Ideal for long-running operations where you need immediate feedback.
+
+**Syntax:**
+```sql
+SELECT text FROM mcp_call_tool('<tool_name>', '<json_arguments>');
+```
+
+**Parameters:**
+- `tool_name` (TEXT) - Name of tool to call (first function argument)
+- `arguments` (TEXT) - JSON arguments for the tool (second function argument)
+
+**Returns:**
+- `text` (TEXT) - Text content streamed as it arrives
+
+**Example:**
+```sql
+-- Stream results from a tool call
+SELECT text FROM mcp_call_tool(
+  'browser_navigate',
+  '{"url": "https://sqlite.ai"}'
+);
+
+-- Stream search results
+SELECT text FROM mcp_call_tool(
+  'airbnb_search',
+  '{"location": "Rome", "maxPrice": 100}'
+);
+```
+
+**Result:**
+```
+text
+----------------------------------------------------
+Found 5 listings in Rome under $100
+Listing 1: Cozy Apartment - $85/night
+Listing 2: Historic Studio - $95/night
+```
+
+**When to use:**
+- Long-running tool operations (web scraping, large data processing)
+- Real-time feedback needed (progress updates, partial results)
+- Memory-efficient processing of large responses
+- Interactive applications requiring immediate output
+
+**Comparison with `mcp_call_tool_respond`:**
+| Feature | `mcp_call_tool` | `mcp_call_tool_respond` |
+|---------|----------------------|---------------------|
+| Response delivery | Real-time chunks | Complete response |
+| Memory usage | Low (streaming) | Higher (full result) |
+| Use case | Long operations | Quick queries |
+| Latency | Immediate first chunk | Wait for completion |
 
 ---
 
@@ -279,106 +359,44 @@ The extension provides multiple ways to access MCP functionality:
 
 ### Scalar Functions (Return JSON strings)
 
-- `mcp_list_tools()` - Returns JSON string of all tools
-- `mcp_call_tool(tool_name, arguments)` - Returns JSON string of tool result
-- `mcp_tools_json()` - Alias for `mcp_list_tools()`
-- `mcp_call_tool_json(tool_name, arguments)` - Alias for `mcp_call_tool()`
+- `mcp_list_tools_json()` - Returns JSON string of all tools
+- `mcp_call_tool_json(tool_name, arguments)` - Returns JSON string of tool result
 
 **Behavior:**
-- Returns the complete JSON response from MCP
-- When JSON extension mode is enabled (`use_json_ext=1`), results are marked with JSON subtype for seamless use with SQLite JSON functions
-- When JSON extension mode is disabled, results are returned as plain text
+- Returns the complete JSON response from MCP as plain text
+- Use these when you need the raw JSON response
 
 Use these when you need the raw JSON response or want to process with `json_extract()`.
 
 ### Virtual Tables (Return structured rows)
 
-- `mcp_tools_table` - Returns tools as rows with named columns
-- `mcp_call_tool_table` - Returns text results as rows
+**Non-Streaming Tables:**
+- `mcp_list_tools_respond` - Returns tools as rows with named columns
+- `mcp_call_tool_respond(tool_name, arguments)` - Returns text results as rows
+
+**Streaming Tables:**
+- `mcp_list_tools` - Streams tools as they arrive from server  
+- `mcp_call_tool(tool_name, arguments)` - Streams text results in real-time
 
 **Behavior:**
-- Always extract and parse the JSON response using SQLite's `json_each()` function
-- Return structured rows regardless of JSON extension mode setting
-- `mcp_tools_table` extracts the `$.tools` array and returns each tool as a row
-- `mcp_call_tool_table` extracts the `$.result.content` array and returns each `type="text"` item as a row
+- Always extract and parse the JSON response
+- Streaming tables deliver results immediately as they arrive, non-streaming tables wait for complete response
 
-Use these when you need to process multiple items, filter with WHERE clauses, or join with other tables.
+Use non-streaming tables for quick queries and when you need the complete response. Use streaming tables for long-running operations, real-time feedback, or memory-efficient processing.
 
 **Example comparing approaches:**
 
 ```sql
 -- Scalar function approach
 SELECT json_extract(value, '$.name')
-FROM json_each((SELECT mcp_list_tools()), '$.tools')
+FROM json_each((SELECT mcp_list_tools_json()), '$.tools')
 WHERE json_extract(value, '$.name') LIKE 'airbnb%';
 
 -- Virtual table approach (simpler)
 SELECT name
-FROM mcp_tools_table
+FROM mcp_list_tools_respond
 WHERE name LIKE 'airbnb%';
 ```
-
----
-
-## JSON Extension Mode
-
-### Benefits
-
-- **Direct JSON Operations**: Use `json_extract()`, `json_each()`, `json_array_length()` and other SQLite JSON functions directly on results
-- **Type Safety**: SQLite recognizes results as JSON type, not plain text
-- **Cleaner Queries**: No need to wrap results in `json()` function calls
-- **Better Performance**: SQLite can optimize JSON operations when the type is known
-
-### Usage Examples
-
-**Without JSON Extension Mode (default):**
-```sql
--- Connect in regular text mode
-SELECT mcp_connect('http://localhost:8000/mcp', 0, NULL, 0);
-
--- Need to explicitly parse as JSON
-SELECT json_extract(json(mcp_list_tools()), '$.tools[0].name');
-```
-
-**With JSON Extension Mode:**
-```sql
--- Connect with JSON extension mode enabled
-SELECT mcp_connect('http://localhost:8000/mcp', 0, NULL, 1);
-
--- Results are automatically recognized as JSON
-SELECT json_extract(mcp_list_tools(), '$.tools[0].name');
-
--- Extract connection status
-SELECT json_extract(
-  mcp_connect('http://localhost:8000/mcp', 0, NULL, 1),
-  '$.status'
-) as status;
-
--- List all available tools using json_each
-SELECT
-  json_extract(value, '$.name') as tool_name,
-  json_extract(value, '$.description') as description
-FROM json_each((SELECT mcp_list_tools()), '$.tools');
-
--- Extract tool result content
-SELECT json_extract(
-  mcp_call_tool('airbnb_search', '{"location": "Rome"}'),
-  '$.result.content[0].text'
-) as result_text;
-```
-
-### When to Use JSON Extension Mode
-
-**Use JSON extension mode when:**
-- You need to extract specific fields from results using `json_extract()`
-- You want to iterate over arrays in results using `json_each()`
-- You're building queries that process JSON results
-- You want type safety for JSON operations
-
-**Use regular text mode when:**
-- You just need the raw JSON string
-- You're displaying results to users without processing
-- You're integrating with systems that expect text output
 
 ---
 
@@ -391,14 +409,14 @@ Modern streaming HTTP transport for MCP servers.
 
 ```sql
 SELECT mcp_connect('http://localhost:8000/mcp');
-SELECT mcp_connect('http://localhost:8000/mcp', 0);  -- Explicit
+SELECT mcp_connect('http://localhost:8000/mcp', NULL, 0);  -- Explicit
 ```
 
 ### SSE (Legacy)
 Server-Sent Events transport for compatibility with older MCP servers.
 
 ```sql
-SELECT mcp_connect('http://localhost:8931/sse', 1);
+SELECT mcp_connect('http://localhost:8931/sse', NULL, 1);
 ```
 
 ---
@@ -423,5 +441,5 @@ SELECT
     THEN 'Error: ' || json_extract(result, '$.error')
     ELSE 'Success'
   END
-FROM (SELECT mcp_call_tool('test', '{}') as result);
+FROM (SELECT mcp_call_tool_json('test', '{}') as result);
 ```
