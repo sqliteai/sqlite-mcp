@@ -92,9 +92,10 @@ int test_mcp_version(sqlite3 *db) {
         return 1;
     }
 
-    // Check if version matches expected format (e.g., "0.1.0")
-    if (strcmp((const char *)version, "0.1.0") != 0) {
-        fprintf(stderr, "    Unexpected version: %s\n", version);
+    // Check if version matches format X.Y.Z
+    int major, minor, patch;
+    if (sscanf((const char *)version, "%d.%d.%d", &major, &minor, &patch) != 3) {
+        fprintf(stderr, "    Invalid version format: %s (expected X.Y.Z)\n", version);
         sqlite3_finalize(stmt);
         return 1;
     }
