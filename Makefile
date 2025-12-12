@@ -260,7 +260,6 @@ clean:
 	find $(BUILD_DIR) -mindepth 1 -maxdepth 1 ! -name openssl -exec rm -rf {} +
 	$(CARGO) clean
 
-# XCFramework build for Swift Package Manager
 .NOTPARALLEL: %.dylib
 %.dylib:
 	rm -rf $(BUILD_DIR) && $(MAKE) PLATFORM=$*
