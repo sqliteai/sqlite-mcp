@@ -788,7 +788,8 @@ pub extern "C" fn mcp_list_tools_init() -> usize {
             // Clone the Arc to share the service across async boundaries
             let service_arc = client.service.clone();
 
-            // Spawn directly on the runtime (Windows compatible)
+            // Enter the runtime context explicitly before spawning (Windows compatible)
+            let _guard = client.runtime.enter();
             client.runtime.spawn(async move {
                 let service_guard = service_arc.lock().await;
                 if let Some(service) = service_guard.as_ref() {
@@ -872,7 +873,8 @@ pub extern "C" fn mcp_call_tool_init(tool_name: *const c_char, arguments: *const
         if let Some(client) = client_opt.as_ref() {
             let service_arc = client.service.clone();
 
-            // Spawn directly on the runtime (Windows compatible)
+            // Enter the runtime context explicitly before spawning (Windows compatible)
+            let _guard = client.runtime.enter();
             client.runtime.spawn(async move {
                 let service_guard = service_arc.lock().await;
                 if let Some(service) = service_guard.as_ref() {
