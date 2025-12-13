@@ -579,13 +579,10 @@ pub extern "C" fn mcp_disconnect() -> *mut c_char {
     
     // Also clear any active stream channels
     {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            let mut channels = STREAM_CHANNELS.lock().await;
-            channels.clear();
-        });
+        let mut channels = STREAM_CHANNELS.lock().unwrap();
+        channels.clear();
     }
-    
+
     // Reset stream counter
     *STREAM_COUNTER.lock().unwrap() = 0;
     
@@ -740,8 +737,8 @@ use std::collections::HashMap;
 use tokio::sync::Mutex as TokioMutex;
 
 lazy_static::lazy_static! {
-    static ref STREAM_CHANNELS: Arc<TokioMutex<HashMap<usize, tokio::sync::mpsc::UnboundedReceiver<StreamChunk>>>> =
-        Arc::new(TokioMutex::new(HashMap::new()));
+    static ref STREAM_CHANNELS: Arc<Mutex<HashMap<usize, tokio::sync::mpsc::UnboundedReceiver<StreamChunk>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     static ref STREAM_COUNTER: Mutex<usize> = Mutex::new(0);
 }
 
@@ -825,12 +822,9 @@ pub extern "C" fn mcp_list_tools_init() -> usize {
     } // Release the lock here
 
     // Store the receiver in global storage (now safe to acquire lock again)
-    let client_opt = client_mutex.lock().unwrap();
-    if let Some(client) = client_opt.as_ref() {
-        client.runtime.block_on(async {
-            let mut channels = STREAM_CHANNELS.lock().await;
-            channels.insert(stream_id, rx);
-        });
+    {
+        let mut channels = STREAM_CHANNELS.lock().unwrap();
+        channels.insert(stream_id, rx);
     }
 
     stream_id
@@ -936,12 +930,9 @@ pub extern "C" fn mcp_call_tool_init(tool_name: *const c_char, arguments: *const
     }
 
     // Store the receiver
-    let client_opt = client_mutex.lock().unwrap();
-    if let Some(client) = client_opt.as_ref() {
-        client.runtime.block_on(async {
-            let mut channels = STREAM_CHANNELS.lock().await;
-            channels.insert(stream_id, rx);
-        });
+    {
+        let mut channels = STREAM_CHANNELS.lock().unwrap();
+        channels.insert(stream_id, rx);
     }
 
     stream_id
@@ -954,20 +945,18 @@ pub extern "C" fn mcp_stream_next(stream_id: usize) -> *mut StreamResult {
     let client_mutex = GLOBAL_CLIENT.get_or_init(|| Mutex::new(None));
     let client_opt = client_mutex.lock().unwrap();
 
-    if let Some(client) = client_opt.as_ref() {
-        client.runtime.block_on(async {
-            let mut channels = STREAM_CHANNELS.lock().await;
-            if let Some(rx) = channels.get_mut(&stream_id) {
-                match rx.try_recv() {
-                    Ok(chunk) => {
-                        Box::into_raw(Box::new(chunk_to_stream_result(chunk)))
-                    }
-                    Err(_) => ptr::null_mut(),
+    if let Some(_client) = client_opt.as_ref() {
+        let mut channels = STREAM_CHANNELS.lock().unwrap();
+        if let Some(rx) = channels.get_mut(&stream_id) {
+            match rx.try_recv() {
+                Ok(chunk) => {
+                    Box::into_raw(Box::new(chunk_to_stream_result(chunk)))
                 }
-            } else {
-                ptr::null_mut()
+                Err(_) => ptr::null_mut(),
             }
-        })
+        } else {
+            ptr::null_mut()
+        }
     } else {
         ptr::null_mut()
     }
@@ -982,9 +971,11 @@ pub extern "C" fn mcp_stream_wait(stream_id: usize, timeout_ms: u64) -> *mut Str
     let client_opt = client_mutex.lock().unwrap();
 
     if let Some(client) = client_opt.as_ref() {
-        client.runtime.block_on(async {
-            let mut channels = STREAM_CHANNELS.lock().await;
-            if let Some(rx) = channels.get_mut(&stream_id) {
+        // Get mutable reference to receiver outside of async block
+        let mut channels = STREAM_CHANNELS.lock().unwrap();
+        if let Some(rx) = channels.get_mut(&stream_id) {
+            // We need to use block_on for the async recv operation
+            client.runtime.block_on(async {
                 let timeout = tokio::time::Duration::from_millis(timeout_ms);
                 match tokio::time::timeout(timeout, rx.recv()).await {
                     Ok(Some(chunk)) => {
@@ -992,10 +983,10 @@ pub extern "C" fn mcp_stream_wait(stream_id: usize, timeout_ms: u64) -> *mut Str
                     }
                     _ => ptr::null_mut(),
                 }
-            } else {
-                ptr::null_mut()
-            }
-        })
+            })
+        } else {
+            ptr::null_mut()
+        }
     } else {
         ptr::null_mut()
     }
@@ -1007,11 +998,9 @@ pub extern "C" fn mcp_stream_cleanup(stream_id: usize) {
     let client_mutex = GLOBAL_CLIENT.get_or_init(|| Mutex::new(None));
     let client_opt = client_mutex.lock().unwrap();
 
-    if let Some(client) = client_opt.as_ref() {
-        client.runtime.block_on(async {
-            let mut channels = STREAM_CHANNELS.lock().await;
-            channels.remove(&stream_id);
-        });
+    if let Some(_client) = client_opt.as_ref() {
+        let mut channels = STREAM_CHANNELS.lock().unwrap();
+        channels.remove(&stream_id);
     }
 }
 
