@@ -797,7 +797,7 @@ pub extern "C" fn mcp_list_tools_init() -> usize {
     // Get the global client
     let client_mutex = GLOBAL_CLIENT.get_or_init(|| Mutex::new(None));
 
-    // Spawn the async task using spawn_blocking + block_on for Windows compatibility
+    // Spawn the async task on the runtime
     {
         let client_opt = client_mutex.lock().unwrap();
         if let Some(client) = client_opt.as_ref() {
@@ -805,34 +805,30 @@ pub extern "C" fn mcp_list_tools_init() -> usize {
             let service_arc = client.service.clone();
             let runtime_handle = client.runtime.handle().clone();
 
-            // Use spawn_blocking to run a blocking task that calls block_on
-            // This ensures the reactor is running when async code executes (Windows fix)
-            std::thread::spawn(move || {
-                let _guard = runtime_handle.enter();  // Enter runtime context first
-                runtime_handle.block_on(async move {
-                    let service_guard = service_arc.lock().await;
-                    if let Some(service) = service_guard.as_ref() {
-                        match service.list_tools(None).await {
-                            Ok(response) => {
-                                // Send each tool as a separate chunk
-                                for tool in response.tools {
-                                    if let Ok(tool_json) = serde_json::to_value(&tool) {
-                                        let _ = tx.send(StreamChunk::Tool(tool_json));
-                                    }
+            // Spawn directly on the runtime (works with both multi-threaded and current-thread runtimes)
+            runtime_handle.spawn(async move {
+                let service_guard = service_arc.lock().await;
+                if let Some(service) = service_guard.as_ref() {
+                    match service.list_tools(None).await {
+                        Ok(response) => {
+                            // Send each tool as a separate chunk
+                            for tool in response.tools {
+                                if let Ok(tool_json) = serde_json::to_value(&tool) {
+                                    let _ = tx.send(StreamChunk::Tool(tool_json));
                                 }
-                                let _ = tx.send(StreamChunk::Done);
                             }
-                            Err(e) => {
-                                let _ = tx.send(StreamChunk::Error(format!("Failed to list tools: {}", e)));
-                                let _ = tx.send(StreamChunk::Done);
-                            }
+                            let _ = tx.send(StreamChunk::Done);
                         }
-                    } else {
-                        // No service connected
-                        let _ = tx.send(StreamChunk::Error("Not connected. Call mcp_connect() first".to_string()));
-                        let _ = tx.send(StreamChunk::Done);
+                        Err(e) => {
+                            let _ = tx.send(StreamChunk::Error(format!("Failed to list tools: {}", e)));
+                            let _ = tx.send(StreamChunk::Done);
+                        }
                     }
-                });
+                } else {
+                    // No service connected
+                    let _ = tx.send(StreamChunk::Error("Not connected. Call mcp_connect() first".to_string()));
+                    let _ = tx.send(StreamChunk::Done);
+                }
             });
         } else {
             // No client initialized
@@ -887,65 +883,61 @@ pub extern "C" fn mcp_call_tool_init(tool_name: *const c_char, arguments: *const
     // Get the global client
     let client_mutex = GLOBAL_CLIENT.get_or_init(|| Mutex::new(None));
 
-    // Spawn the async task using spawn_blocking + block_on for Windows compatibility
+    // Spawn the async task on the runtime
     {
         let client_opt = client_mutex.lock().unwrap();
         if let Some(client) = client_opt.as_ref() {
             let service_arc = client.service.clone();
             let runtime_handle = client.runtime.handle().clone();
 
-            // Use spawn_blocking to run a blocking task that calls block_on
-            // This ensures the reactor is running when async code executes (Windows fix)
-            std::thread::spawn(move || {
-                let _guard = runtime_handle.enter();  // Enter runtime context first
-                runtime_handle.block_on(async move {
-                    let service_guard = service_arc.lock().await;
-                    if let Some(service) = service_guard.as_ref() {
-                        // Parse arguments
-                        let arguments_json: serde_json::Value = match serde_json::from_str(&arguments_str) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                let _ = tx.send(StreamChunk::Error(format!("Invalid JSON arguments: {}", e)));
-                                let _ = tx.send(StreamChunk::Done);
-                                return;
-                            }
-                        };
+            // Spawn directly on the runtime (works with both multi-threaded and current-thread runtimes)
+            runtime_handle.spawn(async move {
+                let service_guard = service_arc.lock().await;
+                if let Some(service) = service_guard.as_ref() {
+                    // Parse arguments
+                    let arguments_json: serde_json::Value = match serde_json::from_str(&arguments_str) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = tx.send(StreamChunk::Error(format!("Invalid JSON arguments: {}", e)));
+                            let _ = tx.send(StreamChunk::Done);
+                            return;
+                        }
+                    };
 
-                        // Create the call tool parameter
-                        let call_param = rmcp::model::CallToolRequestParam {
-                            name: std::borrow::Cow::Owned(tool_name_str),
-                            arguments: arguments_json.as_object().cloned(),
-                        };
+                    // Create the call tool parameter
+                    let call_param = rmcp::model::CallToolRequestParam {
+                        name: std::borrow::Cow::Owned(tool_name_str),
+                        arguments: arguments_json.as_object().cloned(),
+                    };
 
-                        // Call the tool
-                        match service.call_tool(call_param).await {
-                            Ok(result) => {
-                                // Serialize the result to JSON and extract text content
-                                if let Ok(result_json) = serde_json::to_value(&result) {
-                                    if let Some(content_array) = result_json.get("content").and_then(|v| v.as_array()) {
-                                        for item in content_array {
-                                            if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
-                                                if item_type == "text" {
-                                                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                                                        let _ = tx.send(StreamChunk::Text(text.to_string()));
-                                                    }
+                    // Call the tool
+                    match service.call_tool(call_param).await {
+                        Ok(result) => {
+                            // Serialize the result to JSON and extract text content
+                            if let Ok(result_json) = serde_json::to_value(&result) {
+                                if let Some(content_array) = result_json.get("content").and_then(|v| v.as_array()) {
+                                    for item in content_array {
+                                        if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
+                                            if item_type == "text" {
+                                                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                                                    let _ = tx.send(StreamChunk::Text(text.to_string()));
                                                 }
                                             }
                                         }
                                     }
                                 }
-                                let _ = tx.send(StreamChunk::Done);
                             }
-                            Err(e) => {
-                                let _ = tx.send(StreamChunk::Error(format!("Failed to call tool: {}", e)));
-                                let _ = tx.send(StreamChunk::Done);
-                            }
+                            let _ = tx.send(StreamChunk::Done);
                         }
-                    } else {
-                        let _ = tx.send(StreamChunk::Error("Not connected. Call mcp_connect() first".to_string()));
-                        let _ = tx.send(StreamChunk::Done);
+                        Err(e) => {
+                            let _ = tx.send(StreamChunk::Error(format!("Failed to call tool: {}", e)));
+                            let _ = tx.send(StreamChunk::Done);
+                        }
                     }
-                });
+                } else {
+                    let _ = tx.send(StreamChunk::Error("Not connected. Call mcp_connect() first".to_string()));
+                    let _ = tx.send(StreamChunk::Done);
+                }
             });
         } else {
             let _ = tx.send(StreamChunk::Error("Client not initialized".to_string()));
