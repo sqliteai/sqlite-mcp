@@ -789,11 +789,12 @@ pub extern "C" fn mcp_list_tools_init() -> usize {
             let service_arc = client.service.clone();
             let runtime_handle = client.runtime.handle().clone();
 
-            // Spawn directly on the runtime (works with both multi-threaded and current-thread runtimes)
-            runtime_handle.spawn(async move {
-                let service_guard = service_arc.lock().await;
-                if let Some(service) = service_guard.as_ref() {
-                    match service.list_tools(None).await {
+            // Use spawn_blocking which handles FFI context better on Windows
+            runtime_handle.spawn_blocking(move || {
+                runtime_handle.block_on(async move {
+                    let service_guard = service_arc.lock().await;
+                    if let Some(service) = service_guard.as_ref() {
+                        match service.list_tools(None).await {
                         Ok(response) => {
                             // Send each tool as a separate chunk
                             for tool in response.tools {
@@ -813,6 +814,7 @@ pub extern "C" fn mcp_list_tools_init() -> usize {
                     let _ = tx.send(StreamChunk::Error("Not connected. Call mcp_connect() first".to_string()));
                     let _ = tx.send(StreamChunk::Done);
                 }
+                })
             });
         } else {
             // No client initialized
@@ -874,12 +876,13 @@ pub extern "C" fn mcp_call_tool_init(tool_name: *const c_char, arguments: *const
             let service_arc = client.service.clone();
             let runtime_handle = client.runtime.handle().clone();
 
-            // Spawn directly on the runtime (works with both multi-threaded and current-thread runtimes)
-            runtime_handle.spawn(async move {
-                let service_guard = service_arc.lock().await;
-                if let Some(service) = service_guard.as_ref() {
-                    // Parse arguments
-                    let arguments_json: serde_json::Value = match serde_json::from_str(&arguments_str) {
+            // Use spawn_blocking which handles FFI context better on Windows
+            runtime_handle.spawn_blocking(move || {
+                runtime_handle.block_on(async move {
+                    let service_guard = service_arc.lock().await;
+                    if let Some(service) = service_guard.as_ref() {
+                        // Parse arguments
+                        let arguments_json: serde_json::Value = match serde_json::from_str(&arguments_str) {
                         Ok(v) => v,
                         Err(e) => {
                             let _ = tx.send(StreamChunk::Error(format!("Invalid JSON arguments: {}", e)));
@@ -922,6 +925,7 @@ pub extern "C" fn mcp_call_tool_init(tool_name: *const c_char, arguments: *const
                     let _ = tx.send(StreamChunk::Error("Not connected. Call mcp_connect() first".to_string()));
                     let _ = tx.send(StreamChunk::Done);
                 }
+                })
             });
         } else {
             let _ = tx.send(StreamChunk::Error("Client not initialized".to_string()));
