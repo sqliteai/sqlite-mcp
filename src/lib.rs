@@ -792,6 +792,7 @@ pub extern "C" fn mcp_list_tools_init() -> usize {
             // Use spawn_blocking to run a blocking task that calls block_on
             // This ensures the reactor is running when async code executes (Windows fix)
             std::thread::spawn(move || {
+                let _guard = runtime_handle.enter();  // Enter runtime context first
                 runtime_handle.block_on(async move {
                     let service_guard = service_arc.lock().await;
                     if let Some(service) = service_guard.as_ref() {
@@ -880,6 +881,7 @@ pub extern "C" fn mcp_call_tool_init(tool_name: *const c_char, arguments: *const
             // Use spawn_blocking to run a blocking task that calls block_on
             // This ensures the reactor is running when async code executes (Windows fix)
             std::thread::spawn(move || {
+                let _guard = runtime_handle.enter();  // Enter runtime context first
                 runtime_handle.block_on(async move {
                     let service_guard = service_arc.lock().await;
                     if let Some(service) = service_guard.as_ref() {
