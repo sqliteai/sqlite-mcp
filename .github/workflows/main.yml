@@ -148,7 +148,7 @@ jobs:
       - name: build sqlite-mcp
         run: ${{ matrix.name == 'linux-musl' && matrix.arch == 'arm64' && 'docker exec alpine' || '' }} make extension ${{ matrix.make && matrix.make || ''}}
         env:
-          RUST_BACKTRACE: ${{ matrix.name == 'windows' && '1' || '0' }}
+          RUST_BACKTRACE: ${{ matrix.name == 'windows' && 'full' || '0' }}
 
       - name: create keychain for codesign
         if: matrix.os == 'macos-15'
@@ -233,7 +233,7 @@ jobs:
       - name: test sqlite-mcp
         if: ( matrix.name == 'linux' && matrix.arch == 'x86_64' ) || matrix.name == 'windows' || ( matrix.name == 'macos' && matrix.arch != 'x86_64' )
         env:
-          RUST_BACKTRACE: ${{ matrix.name == 'windows' && '1' || '0' }}
+          RUST_BACKTRACE: ${{ matrix.name == 'windows' && 'full' || '0' }}
         run: make test ${{ matrix.make && matrix.make || ''}}
 
       - uses: actions/upload-artifact@v4.6.2
