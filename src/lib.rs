@@ -792,6 +792,8 @@ pub extern "C" fn mcp_list_tools_init() -> usize {
             // Use spawn_blocking which handles FFI context better on Windows
             let runtime_handle_clone = runtime_handle.clone();
             runtime_handle.spawn_blocking(move || {
+                // Enter runtime context BEFORE block_on to set thread-local runtime for tokio::spawn()
+                let _guard = runtime_handle_clone.enter();
                 runtime_handle_clone.block_on(async move {
                     let service_guard = service_arc.lock().await;
                     if let Some(service) = service_guard.as_ref() {
@@ -880,6 +882,8 @@ pub extern "C" fn mcp_call_tool_init(tool_name: *const c_char, arguments: *const
             // Use spawn_blocking which handles FFI context better on Windows
             let runtime_handle_clone = runtime_handle.clone();
             runtime_handle.spawn_blocking(move || {
+                // Enter runtime context BEFORE block_on to set thread-local runtime for tokio::spawn()
+                let _guard = runtime_handle_clone.enter();
                 runtime_handle_clone.block_on(async move {
                     let service_guard = service_arc.lock().await;
                     if let Some(service) = service_guard.as_ref() {
