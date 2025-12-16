@@ -147,6 +147,8 @@ jobs:
 
       - name: build sqlite-mcp
         run: ${{ matrix.name == 'linux-musl' && matrix.arch == 'arm64' && 'docker exec alpine' || '' }} make extension ${{ matrix.make && matrix.make || ''}}
+        env:
+          RUST_BACKTRACE: ${{ matrix.name == 'windows' && '1' || '0' }}
 
       - name: create keychain for codesign
         if: matrix.os == 'macos-15'

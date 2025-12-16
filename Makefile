@@ -57,10 +57,11 @@ ifeq ($(PLATFORM),windows)
 	TARGET := $(DIST_DIR)/mcp.dll
 	LDFLAGS += -shared -Wl,--gc-sections
 	DEF_FILE := $(BUILD_DIR)/mcp.def
-	STRIP = strip --strip-unneeded $@
+	# STRIP = strip --strip-unneeded $@  # Disabled for debugging
+	STRIP = @echo "Skipping strip for debugging"
 	LIBS = -lmcp_ffi -lws2_32 -luserenv -lbcrypt -lntdll -lgcc -lgcc_eh -lpthread
 	T_LIBS = -lm
-	RUSTFLAGS = -C opt-level=z -C lto=fat -C codegen-units=1 -C strip=symbols
+	RUSTFLAGS = -g  # Debug symbols for backtrace
 else ifeq ($(PLATFORM),macos)
 	TARGET := $(DIST_DIR)/mcp.dylib
 	MACOS_MIN_VERSION = 11.0
