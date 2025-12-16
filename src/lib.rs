@@ -246,7 +246,16 @@ pub struct McpClient {
 /// Returns NULL on error
 #[no_mangle]
 pub extern "C" fn mcp_client_new() -> *mut McpClient {
-    match tokio::runtime::Runtime::new() {
+    // On Windows, use current-thread runtime for better compatibility
+    let runtime_result = if cfg!(windows) {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+    } else {
+        tokio::runtime::Runtime::new()
+    };
+
+    match runtime_result {
         Ok(runtime) => {
             let client = Box::new(McpClient {
                 runtime,
@@ -324,8 +333,15 @@ pub extern "C" fn mcp_connect(
     };
 
     // Create a new McpClient with runtime
+    // On Windows, use current-thread runtime for better compatibility
     let new_client = McpClient {
-        runtime: match tokio::runtime::Runtime::new() {
+        runtime: match if cfg!(windows) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+        } else {
+            tokio::runtime::Runtime::new()
+        } {
             Ok(r) => r,
             Err(e) => {
                 let error = format!(r#"{{"error": "Failed to create runtime: {}"}}"#, e);
