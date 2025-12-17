@@ -260,9 +260,7 @@ fn run_async<F, T>(future: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
-    let runtime = get_runtime();
-    let _enter = runtime.enter();
-    runtime.block_on(future)
+    get_runtime().block_on(future)
 }
 
 /// Create a new MCP client
