@@ -247,7 +247,8 @@ pub struct McpClient {
 /// Get or create the global Tokio runtime
 fn get_runtime() -> &'static tokio::runtime::Runtime {
     GLOBAL_RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
+        // Use single-threaded runtime to avoid TLS issues with nested spawns on Windows
+        tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("Failed to create Tokio runtime")
@@ -802,11 +803,8 @@ pub extern "C" fn mcp_list_tools_init() -> usize {
         if let Some(client) = client_opt.as_ref() {
             // Clone the Arc to share the service across async boundaries
             let service_arc = client.service.clone();
-            // Enter runtime context before spawning (Windows fix)
-            let runtime = get_runtime();
-            let _enter = runtime.enter();
-            // Spawn async task directly on the global runtime (like the official rmcp examples)
-            runtime.spawn(async move {
+            // Spawn async task on the runtime
+            get_runtime().spawn(async move {
                 let service_guard = service_arc.lock().await;
                 if let Some(service) = service_guard.as_ref() {
                     match service.list_tools(None).await {
@@ -888,11 +886,8 @@ pub extern "C" fn mcp_call_tool_init(tool_name: *const c_char, arguments: *const
         let client_opt = client_mutex.lock().unwrap();
         if let Some(client) = client_opt.as_ref() {
             let service_arc = client.service.clone();
-            // Enter runtime context before spawning (Windows fix)
-            let runtime = get_runtime();
-            let _enter = runtime.enter();
-            // Spawn async task directly on the global runtime (like the official rmcp examples)
-            runtime.spawn(async move {
+            // Spawn async task on the runtime
+            get_runtime().spawn(async move {
                 let service_guard = service_arc.lock().await;
                 if let Some(service) = service_guard.as_ref() {
                     // Parse arguments
