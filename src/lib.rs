@@ -1,22 +1,259 @@
 //
-//  lib.rs
+//  lib.rs (New Windows-compatible version)
 //  sqlitemcp
 //
-//  Created by Gioele Cantoni on 05/11/25.
+//  Single global Tokio runtime architecture to fix Windows issues
 //
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::mpsc::{self, Sender, Receiver};
+use std::thread;
 
 use rmcp::transport::{SseClientTransport, StreamableHttpClientTransport};
 use rmcp::{ServiceExt, RoleClient};
-use rmcp::model::{ClientInfo, ClientCapabilities, Implementation};
+use rmcp::model::{ClientInfo, ClientCapabilities, Implementation, ProtocolVersion};
 use serde_json;
 
-// Global client instance - one client per process
-static GLOBAL_CLIENT: OnceLock<Mutex<Option<McpClient>>> = OnceLock::new();
+// === SINGLE GLOBAL RUNTIME ARCHITECTURE ===
+// This is the ONLY Tokio runtime in the entire process
+
+static GLOBAL_RUNTIME: OnceLock<GlobalRuntime> = OnceLock::new();
+
+/// Single global runtime with dedicated worker thread
+/// This ensures ALL async operations happen on the same runtime
+struct GlobalRuntime {
+    sender: Sender<RuntimeCommand>,
+    _worker_handle: thread::JoinHandle<()>,
+}
+
+/// Commands sent to the runtime worker thread
+enum RuntimeCommand {
+    Connect { 
+        url: String, 
+        headers: Option<String>,
+        legacy_sse: bool,
+        response: Sender<Result<String, String>> 
+    },
+    ListTools { 
+        response: Sender<Result<String, String>> 
+    },
+    CallTool { 
+        name: String, 
+        args: String,
+        response: Sender<Result<String, String>> 
+    },
+    Disconnect { 
+        response: Sender<Result<(), String>> 
+    },
+}
+
+impl GlobalRuntime {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        
+        let worker_handle = thread::spawn(move || {
+            // Create the ONE AND ONLY Tokio runtime
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create Tokio runtime");
+            
+            // This thread will run ALL async operations
+            rt.block_on(async move {
+                let mut client: Option<RunningClient> = None;
+                
+                while let Ok(cmd) = receiver.recv() {
+                    match cmd {
+                        RuntimeCommand::Connect { url, headers, legacy_sse, response } => {
+                            let result = Self::handle_connect(&mut client, url, headers, legacy_sse).await;
+                            let _ = response.send(result);
+                        }
+                        RuntimeCommand::ListTools { response } => {
+                            let result = Self::handle_list_tools(&client).await;
+                            let _ = response.send(result);
+                        }
+                        RuntimeCommand::CallTool { name, args, response } => {
+                            let result = Self::handle_call_tool(&client, name, args).await;
+                            let _ = response.send(result);
+                        }
+                        RuntimeCommand::Disconnect { response } => {
+                            client = None;
+                            let _ = response.send(Ok(()));
+                        }
+                    }
+                }
+            });
+        });
+        
+        Self {
+            sender,
+            _worker_handle: worker_handle,
+        }
+    }
+    
+    async fn handle_connect(
+        client: &mut Option<RunningClient>,
+        url: String,
+        headers: Option<String>,
+        legacy_sse: bool,
+    ) -> Result<String, String> {
+        // Disconnect existing client
+        *client = None;
+        
+        // Parse headers if provided
+        let headers_map: Option<std::collections::HashMap<String, String>> = if let Some(headers_str) = headers {
+            match serde_json::from_str(&headers_str) {
+                Ok(map) => Some(map),
+                Err(_) => return Err("Invalid headers JSON".to_string()),
+            }
+        } else {
+            None
+        };
+        
+        let result = if legacy_sse {
+            Self::connect_sse(url, headers_map).await
+        } else {
+            Self::connect_streamable_http(url, headers_map).await
+        };
+        
+        match result {
+            Ok(service) => {
+                *client = Some(service);
+                Ok("connected".to_string())
+            }
+            Err(e) => Err(format!("Failed to connect to MCP server: {}", e)),
+        }
+    }
+    
+    async fn connect_sse(
+        url: String,
+        headers_map: Option<std::collections::HashMap<String, String>>,
+    ) -> Result<RunningClient, String> {
+        let mut client_builder = reqwest::Client::builder();
+        if let Some(ref headers_map) = headers_map {
+            let mut header_map = reqwest::header::HeaderMap::new();
+            for (key, value) in headers_map {
+                if let (Ok(header_name), Ok(header_value)) = (
+                    reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                    reqwest::header::HeaderValue::from_str(value),
+                ) {
+                    header_map.insert(header_name, header_value);
+                }
+            }
+            client_builder = client_builder.default_headers(header_map);
+        }
+        
+        let http_client = client_builder.build().map_err(|e| e.to_string())?;
+        let transport = Box::new(SseClientTransport::new(http_client));
+        
+        let client_info = ClientInfo {
+            protocol_version: rmcp::model::ProtocolVersion::default(),
+            capabilities: ClientCapabilities::default(),
+            client_info: Implementation {
+                name: "sqlite-mcp".to_string(),
+                title: None,
+                version: "0.1.4".to_string(),
+                icons: None,
+                website_url: None,
+            },
+        };
+        
+        let client_caps = ClientCapabilities::default();
+        
+        rmcp::client::connect(transport, client_info, client_caps, &url)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    
+    async fn connect_streamable_http(
+        url: String,
+        headers_map: Option<std::collections::HashMap<String, String>>,
+    ) -> Result<RunningClient, String> {
+        let auth_header_value = headers_map.as_ref()
+            .and_then(|m| m.get("Authorization"))
+            .map(|s| s.clone());
+        
+        let mut client_builder = reqwest::Client::builder();
+        if let Some(ref headers_map) = headers_map {
+            let mut header_map = reqwest::header::HeaderMap::new();
+            for (key, value) in headers_map {
+                if key != "Authorization" {
+                    if let (Ok(header_name), Ok(header_value)) = (
+                        reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                        reqwest::header::HeaderValue::from_str(value),
+                    ) {
+                        header_map.insert(header_name, header_value);
+                    }
+                }
+            }
+            if !header_map.is_empty() {
+                client_builder = client_builder.default_headers(header_map);
+            }
+        }
+        
+        let http_client = client_builder.build().map_err(|e| e.to_string())?;
+        let transport = Box::new(StreamableHttpClientTransport::new(http_client, auth_header_value));
+        
+        let client_info = ClientInfo {
+            protocol_version: rmcp::model::ProtocolVersion::default(),
+            capabilities: ClientCapabilities::default(),
+            client_info: Implementation {
+                name: "sqlite-mcp".to_string(),
+                title: None,
+                version: "0.1.4".to_string(),
+                icons: None,
+                website_url: None,
+            },
+        };
+        
+        let client_caps = ClientCapabilities::default();
+        
+        rmcp::client::connect(transport, client_info, client_caps, &url)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    
+    async fn handle_list_tools(client: &Option<RunningClient>) -> Result<String, String> {
+        let service = client.as_ref().ok_or("Not connected. Call mcp_connect() first")?;
+        
+        match service.list_tools(None).await {
+            Ok(response) => {
+                serde_json::to_string(&response).map_err(|e| e.to_string())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+    
+    async fn handle_call_tool(
+        client: &Option<RunningClient>,
+        name: String,
+        args: String,
+    ) -> Result<String, String> {
+        let service = client.as_ref().ok_or("Not connected. Call mcp_connect() first")?;
+        
+        let arguments: serde_json::Value = serde_json::from_str(&args)
+            .map_err(|e| format!("Invalid JSON arguments: {}", e))?;
+        
+        match service.call_tool(&name, arguments).await {
+            Ok(response) => {
+                serde_json::to_string(&response).map_err(|e| e.to_string())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+    
+    fn get() -> &'static GlobalRuntime {
+        GLOBAL_RUNTIME.get_or_init(|| GlobalRuntime::new())
+    }
+}
+
+// Type alias for the running client - use dynamic trait object to support both transport types  
+type RunningClient = rmcp::client::RunningClient<
+    Box<dyn rmcp::transport::ClientTransport + Send + Sync>,
+>;
 
 /// Extract error message from JSON error response
 /// Returns the error message string if found, or the original JSON if not found
@@ -51,212 +288,19 @@ pub extern "C" fn mcp_free_string(s: *mut c_char) {
     }
 }
 
-/// Parse tools JSON and extract structured data for virtual table
-/// Returns number of tools found, or 0 on error
-#[no_mangle]
-pub extern "C" fn mcp_parse_tools_json(json_str: *const c_char) -> usize {
-    if json_str.is_null() {
-        return 0;
-    }
-
-    let json_string = unsafe {
-        match CStr::from_ptr(json_str).to_str() {
-            Ok(s) => s,
-            Err(_) => return 0,
-        }
-    };
-
-    // Parse JSON using serde_json
-    match serde_json::from_str::<serde_json::Value>(json_string) {
-        Ok(json) => {
-            if let Some(tools) = json.get("tools").and_then(|v| v.as_array()) {
-                tools.len()
-            } else {
-                0
-            }
-        }
-        Err(_) => 0,
-    }
-}
-
-/// Extract tool data by index for virtual table
-/// Returns allocated string that must be freed, or NULL if index out of bounds
-#[no_mangle]
-pub extern "C" fn mcp_get_tool_field(
-    json_str: *const c_char,
-    tool_index: usize,
-    field_name: *const c_char,
-) -> *mut c_char {
-    if json_str.is_null() || field_name.is_null() {
-        return ptr::null_mut();
-    }
-
-    let json_string = unsafe {
-        match CStr::from_ptr(json_str).to_str() {
-            Ok(s) => s,
-            Err(_) => return ptr::null_mut(),
-        }
-    };
-
-    let field = unsafe {
-        match CStr::from_ptr(field_name).to_str() {
-            Ok(s) => s,
-            Err(_) => return ptr::null_mut(),
-        }
-    };
-
-    // Parse JSON using serde_json
-    match serde_json::from_str::<serde_json::Value>(json_string) {
-        Ok(json) => {
-            // Check if this is a streaming result (single tool object) or batch result (tools array)
-            let tool = if let Some(tools) = json.get("tools").and_then(|v| v.as_array()) {
-                // Batch result: {"tools": [...]}, get tool by index
-                tools.get(tool_index)
-            } else if tool_index == 0 {
-                // Streaming result: single tool object, only valid for index 0
-                Some(&json)
-            } else {
-                None
-            };
-
-            if let Some(tool) = tool {
-                let value = match field {
-                    "name" => tool.get("name"),
-                    "title" => tool.get("title"),
-                    "description" => tool.get("description"),
-                    "inputSchema" => tool.get("inputSchema"),
-                    "outputSchema" => tool.get("outputSchema"),
-                    "annotations" => tool.get("annotations"),
-                    _ => None,
-                };
-
-                if let Some(v) = value {
-                    let result = if v.is_string() {
-                        v.as_str().unwrap_or("").to_string()
-                    } else {
-                        // For complex objects, serialize to JSON
-                        serde_json::to_string(v).unwrap_or_else(|_| "".to_string())
-                    };
-
-                    return match CString::new(result) {
-                        Ok(c_str) => c_str.into_raw(),
-                        Err(_) => ptr::null_mut(),
-                    };
-                }
-            }
-        }
-        Err(_) => {}
-    }
-
-    // Return empty string if field not found
-    match CString::new("") {
-        Ok(c_str) => c_str.into_raw(),
-        Err(_) => ptr::null_mut(),
-    }
-}
-
-/// Parse call tool result JSON and extract text content  
-/// Returns number of text results found, or 0 on error
-#[no_mangle]
-pub extern "C" fn mcp_parse_call_result_json(json_str: *const c_char) -> usize {
-    if json_str.is_null() {
-        return 0;
-    }
-
-    let json_string = unsafe {
-        match CStr::from_ptr(json_str).to_str() {
-            Ok(s) => s,
-            Err(_) => return 0,
-        }
-    };
-
-    // Parse JSON using serde_json
-    match serde_json::from_str::<serde_json::Value>(json_string) {
-        Ok(json) => {
-            // Try both direct content and nested result.content
-            let content_array = json.get("content").and_then(|v| v.as_array())
-                .or_else(|| json.get("result").and_then(|r| r.get("content").and_then(|v| v.as_array())));
-                
-            if let Some(content) = content_array {
-                content.len()
-            } else {
-                0
-            }
-        }
-        Err(_) => 0,
-    }
-}
-
-/// Extract call result text by index for virtual table
-/// Returns allocated string that must be freed, or NULL if index out of bounds
-#[no_mangle]
-pub extern "C" fn mcp_get_call_result_text(
-    json_str: *const c_char,
-    content_index: usize,
-) -> *mut c_char {
-    if json_str.is_null() {
-        return ptr::null_mut();
-    }
-
-    let json_string = unsafe {
-        match CStr::from_ptr(json_str).to_str() {
-            Ok(s) => s,
-            Err(_) => return ptr::null_mut(),
-        }
-    };
-
-    // Parse JSON using serde_json
-    match serde_json::from_str::<serde_json::Value>(json_string) {
-        Ok(json) => {
-            // Try both direct content and nested result.content
-            let content_array = json.get("content").and_then(|v| v.as_array())
-                .or_else(|| json.get("result").and_then(|r| r.get("content").and_then(|v| v.as_array())));
-                
-            if let Some(content) = content_array {
-                if let Some(item) = content.get(content_index) {
-                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                        return match CString::new(text) {
-                            Ok(c_str) => c_str.into_raw(),
-                            Err(_) => ptr::null_mut(),
-                        };
-                    }
-                }
-            }
-        }
-        Err(_) => {}
-    }
-
-    // Return empty string if not found
-    match CString::new("") {
-        Ok(c_str) => c_str.into_raw(),
-        Err(_) => ptr::null_mut(),
-    }
-}
-
-type RunningClient = rmcp::service::RunningService<RoleClient, ClientInfo>;
-
-/// Opaque handle for MCP client
+/// Opaque handle for MCP client - now just a marker since we use global runtime
 pub struct McpClient {
-    runtime: tokio::runtime::Runtime,
-    service: Arc<TokioMutex<Option<RunningClient>>>,
-    server_url: Mutex<Option<String>>,
+    _marker: u8,
 }
 
 /// Create a new MCP client
 /// Returns NULL on error
 #[no_mangle]
 pub extern "C" fn mcp_client_new() -> *mut McpClient {
-    match tokio::runtime::Runtime::new() {
-        Ok(runtime) => {
-            let client = Box::new(McpClient {
-                runtime,
-                service: Arc::new(TokioMutex::new(None)),
-                server_url: Mutex::new(None),
-            });
-            Box::into_raw(client)
-        }
-        Err(_) => ptr::null_mut(),
-    }
+    // Initialize the global runtime on first use
+    let _ = GlobalRuntime::get();
+    // Just return a dummy pointer - all work is done by the global runtime  
+    Box::into_raw(Box::new(McpClient { _marker: 0 }))
 }
 
 /// Free an MCP client
@@ -283,7 +327,7 @@ pub extern "C" fn mcp_connect(
     legacy_sse: i32
 ) -> *mut c_char {
     if server_url.is_null() {
-        let error = r#"{"error": "Invalid arguments"}"#;
+        let error = extract_error_message(r#"{"error": "Invalid arguments"}"#);
         return CString::new(error).unwrap_or_default().into_raw();
     }
 
@@ -291,772 +335,175 @@ pub extern "C" fn mcp_connect(
         match CStr::from_ptr(server_url).to_str() {
             Ok(s) => s.to_string(),
             Err(_) => {
-                let error = r#"{"error": "Invalid server URL"}"#;
+                let error = extract_error_message(r#"{"error": "Invalid server URL"}"#);
                 return CString::new(error).unwrap_or_default().into_raw();
             }
         }
     };
 
     // Parse optional headers_json (can be NULL or a JSON object)
-    let headers_map: Option<std::collections::HashMap<String, String>> = if headers_json.is_null() {
+    let headers_str: Option<String> = if headers_json.is_null() {
         None
     } else {
         unsafe {
             match CStr::from_ptr(headers_json).to_str() {
-                Ok(json_str) => {
-                    // Try to parse as JSON object
-                    match serde_json::from_str::<std::collections::HashMap<String, String>>(json_str) {
-                        Ok(map) => {
-                            Some(map)
-                        },
-                        Err(_e) => {
-                            let error = r#"{"error": "Invalid headers JSON format. Expected: {\"Header-Name\": \"value\"}"}"#;
-                            return CString::new(error).unwrap_or_default().into_raw();
-                        }
-                    }
-                }
+                Ok(json_str) => Some(json_str.to_string()),
                 Err(_) => {
-                    let error = r#"{"error": "Invalid headers string"}"#;
+                    let error = extract_error_message(r#"{"error": "Invalid headers string"}"#);
                     return CString::new(error).unwrap_or_default().into_raw();
                 }
             }
         }
     };
 
-    // Create a new McpClient with runtime
-    let new_client = McpClient {
-        runtime: match tokio::runtime::Runtime::new() {
-            Ok(r) => r,
-            Err(e) => {
-                let error = format!(r#"{{"error": "Failed to create runtime: {}"}}"#, e);
-                return CString::new(error).unwrap_or_default().into_raw();
-            }
-        },
-        service: Arc::new(TokioMutex::new(None)),
-        server_url: Mutex::new(None),
-    };
-
-    let use_sse = legacy_sse != 0;
-
-    let (result, maybe_service) = if use_sse {
-        // Use SSE transport (legacy) with optional custom headers
-        new_client.runtime.block_on(async {
-            // Create HTTP client with optional custom headers
-            let mut client_builder = reqwest::Client::builder();
-            if let Some(ref headers_map) = headers_map {
-                use reqwest::header::{HeaderMap, HeaderValue, HeaderName};
-                let mut headers = HeaderMap::new();
-
-                for (key, value) in headers_map {
-                    match (HeaderName::from_bytes(key.as_bytes()), HeaderValue::from_str(value)) {
-                        (Ok(header_name), Ok(header_value)) => {
-                            headers.insert(header_name, header_value);
-                        }
-                        _ => {
-                            let error = format!(r#"{{"error": "Invalid header format: {}: {}"}}"#, key, value);
-                            return (error, None);
-                        }
-                    }
-                }
-
-                client_builder = client_builder.default_headers(headers);
-            }
-
-            let http_client = match client_builder.build() {
-                Ok(c) => c,
-                Err(e) => {
-                    let error = format!(r#"{{"error": "Failed to create HTTP client: {}"}}"#, e);
-                    return (error, None);
-                }
-            };
-
-            // Build SSE transport with custom HTTP client
-            let sse_config = rmcp::transport::sse_client::SseClientConfig {
-                sse_endpoint: server_url_str.clone().into(),
-                ..Default::default()
-            };
-
-            let transport = match SseClientTransport::start_with_client(http_client, sse_config).await {
-                Ok(t) => t,
-                Err(e) => {
-                    let error = format!(r#"{{"error": "Failed to connect to MCP server: {}"}}"#, e);
-                    return (error, None);
-                }
-            };
-
-            // Create client info
-            let client_info = ClientInfo {
-                protocol_version: Default::default(),
-                capabilities: ClientCapabilities::default(),
-                client_info: Implementation {
-                    name: "sqlite-mcp".to_string(),
-                    title: None,
-                    version: env!("CARGO_PKG_VERSION").to_string(),
-                    website_url: None,
-                    icons: None,
-                },
-            };
-
-            // Create service from transport
-            let service = match client_info.serve(transport).await {
-                Ok(s) => s,
-                Err(e) => {
-                    let error = format!(r#"{{"error": "Failed to initialize service: {}"}}"#, e);
-                    return (error, None);
-                }
-            };
-
-            // Get server info
-            let info = service.peer_info();
-            let (server_name, server_version) = if let Some(info) = info {
-                (
-                    serde_json::to_string(&info.server_info.name).unwrap_or_else(|_| "\"unknown\"".to_string()),
-                    serde_json::to_string(&info.server_info.version).unwrap_or_else(|_| "\"0.0.0\"".to_string())
-                )
-            } else {
-                ("\"unknown\"".to_string(), "\"0.0.0\"".to_string())
-            };
-
-            let result_msg = format!(
-                r#"{{"status": "connected", "server": {}, "version": {}, "transport": "sse"}}"#,
-                server_name, server_version
-            );
-
-            (result_msg, Some((service, server_url_str)))
-        })
-    } else {
-        // Use streamable HTTP transport (default) with optional custom headers
-        new_client.runtime.block_on(async {
-            // For Streamable HTTP, we need to extract the Authorization header specifically
-            // since it has a dedicated field, and we'll use a custom HTTP client for other headers
-            let auth_header_value = headers_map.as_ref().and_then(|m| m.get("Authorization")).map(|s| s.clone());
-
-            // Build streamable HTTP transport config
-            let config = rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig {
-                uri: server_url_str.clone().into(),
-                auth_header: auth_header_value.map(|s| s.into()),
-                ..Default::default()
-            };
-
-            // If there are other custom headers besides Authorization, create a custom HTTP client
-            let transport = if let Some(ref headers_map) = headers_map {
-                let non_auth_headers: std::collections::HashMap<String, String> = headers_map.iter()
-                    .filter(|(k, _)| k.as_str() != "Authorization")
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-
-                if !non_auth_headers.is_empty() {
-                    // Create HTTP client with custom headers
-                    use reqwest::header::{HeaderMap, HeaderValue, HeaderName};
-                    let mut headers = HeaderMap::new();
-
-                    for (key, value) in non_auth_headers {
-                        match (HeaderName::from_bytes(key.as_bytes()), HeaderValue::from_str(&value)) {
-                            (Ok(header_name), Ok(header_value)) => {
-                                headers.insert(header_name, header_value);
-                            }
-                            _ => {
-                                let error = format!(r#"{{"error": "Invalid header format: {}: {}"}}"#, key, value);
-                                return (error, None);
-                            }
-                        }
-                    }
-
-                    let http_client = match reqwest::Client::builder()
-                        .default_headers(headers)
-                        .build() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            let error = format!(r#"{{"error": "Failed to create HTTP client: {}"}}"#, e);
-                            return (error, None);
-                        }
-                    };
-
-                    StreamableHttpClientTransport::with_client(http_client, config)
-                } else {
-                    StreamableHttpClientTransport::from_config(config)
-                }
-            } else {
-                // No custom headers
-                StreamableHttpClientTransport::from_config(config)
-            };
-
-            // Create client info
-            let client_info = ClientInfo {
-                protocol_version: Default::default(),
-                capabilities: ClientCapabilities::default(),
-                client_info: Implementation {
-                    name: "sqlite-mcp".to_string(),
-                    title: None,
-                    version: env!("CARGO_PKG_VERSION").to_string(),
-                    website_url: None,
-                    icons: None,
-                },
-            };
-
-            // Create service from transport
-            let service = match client_info.serve(transport).await {
-                Ok(s) => s,
-                Err(e) => {
-                    let error = format!(r#"{{"error": "Failed to connect to MCP server: {}"}}"#, e);
-                    return (error, None);
-                }
-            };
-
-            // Get server info
-            let info = service.peer_info();
-            let (server_name, server_version) = if let Some(info) = info {
-                (
-                    serde_json::to_string(&info.server_info.name).unwrap_or_else(|_| "\"unknown\"".to_string()),
-                    serde_json::to_string(&info.server_info.version).unwrap_or_else(|_| "\"0.0.0\"".to_string())
-                )
-            } else {
-                ("\"unknown\"".to_string(), "\"0.0.0\"".to_string())
-            };
-
-            let result_msg = format!(
-                r#"{{"status": "connected", "server": {}, "version": {}, "transport": "streamable-http"}}"#,
-                server_name, server_version
-            );
-
-            (result_msg, Some((service, server_url_str)))
-        })
-    };
-
-    // Store service and URL if connection succeeded
-    if let Some((service, url)) = maybe_service {
-        new_client.runtime.block_on(async {
-            *new_client.service.lock().await = Some(service);
-        });
-        *new_client.server_url.lock().unwrap() = Some(url);
-
-        // Store the client globally
-        let global_client = GLOBAL_CLIENT.get_or_init(|| Mutex::new(None));
-        *global_client.lock().unwrap() = Some(new_client);
+    // Send connection request to global runtime
+    let (response_tx, response_rx) = mpsc::channel();
+    let runtime = GlobalRuntime::get();
+    
+    if runtime.sender.send(RuntimeCommand::Connect {
+        url: server_url_str,
+        headers: headers_str,
+        legacy_sse: legacy_sse != 0,
+        response: response_tx,
+    }).is_err() {
+        let error = extract_error_message(r#"{"error": "Failed to send command to runtime"}"#);
+        return CString::new(error).unwrap_or_default().into_raw();
     }
-
-    // Parse the JSON response using serde_json to check status
-    match serde_json::from_str::<serde_json::Value>(&result) {
-        Ok(json) => {
-            if let Some(status) = json.get("status").and_then(|v| v.as_str()) {
-                if status == "connected" {
-                    // Return NULL on successful connection
-                    ptr::null_mut()
-                } else {
-                    // Return error string (extracted from JSON)
-                    let error_msg = extract_error_message(&result);
-                    match CString::new(error_msg) {
-                        Ok(c_str) => c_str.into_raw(),
-                        Err(_) => ptr::null_mut(),
-                    }
-                }
-            } else {
-                // No status field found, extract error message
-                let error_msg = extract_error_message(&result);
-                match CString::new(error_msg) {
-                    Ok(c_str) => c_str.into_raw(),
-                    Err(_) => ptr::null_mut(),
-                }
-            }
+    
+    // Wait for response
+    match response_rx.recv() {
+        Ok(Ok(_)) => {
+            // Success - return NULL (which means success in the API)
+            ptr::null_mut()
+        }
+        Ok(Err(err)) => {
+            // Connection failed
+            let error = extract_error_message(&format!(r#"{{"error": "{}"}}"#, err));
+            CString::new(error).unwrap_or_default().into_raw()
         }
         Err(_) => {
-            // Invalid JSON, return as error string
-            let error_msg = extract_error_message(&result);
-            match CString::new(error_msg) {
-                Ok(c_str) => c_str.into_raw(),
-                Err(_) => ptr::null_mut(),
-            }
+            // Channel error
+            let error = extract_error_message(r#"{"error": "Runtime communication error"}"#);
+            CString::new(error).unwrap_or_default().into_raw()
         }
     }
 }
 
-/// Disconnect from MCP server and reset global client state
+/// Disconnect from MCP server
 /// Returns NULL on success
 #[no_mangle]
 pub extern "C" fn mcp_disconnect() -> *mut c_char {
-    let global_client = GLOBAL_CLIENT.get_or_init(|| Mutex::new(None));
-    *global_client.lock().unwrap() = None;
+    let (response_tx, response_rx) = mpsc::channel();
+    let runtime = GlobalRuntime::get();
     
-    // Also clear any active stream channels
-    {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            let mut channels = STREAM_CHANNELS.lock().await;
-            channels.clear();
-        });
+    if runtime.sender.send(RuntimeCommand::Disconnect {
+        response: response_tx,
+    }).is_err() {
+        let error = extract_error_message(r#"{"error": "Failed to send command to runtime"}"#);
+        return CString::new(error).unwrap_or_default().into_raw();
     }
     
-    // Reset stream counter
-    *STREAM_COUNTER.lock().unwrap() = 0;
-    
-    ptr::null_mut()
+    // Wait for response
+    match response_rx.recv() {
+        Ok(Ok(_)) => ptr::null_mut(), // Success
+        Ok(Err(err)) => {
+            let error = extract_error_message(&format!(r#"{{"error": "{}"}}"#, err));
+            CString::new(error).unwrap_or_default().into_raw()
+        }
+        Err(_) => {
+            let error = extract_error_message(r#"{"error": "Runtime communication error"}"#);
+            CString::new(error).unwrap_or_default().into_raw()
+        }
+    }
 }
 
-/// List tools available on the connected MCP server (returns raw JSON)
-/// Returns: JSON string with tools list (must be freed with mcp_free_string)
+/// List tools from MCP server
+/// Returns JSON string with tools, or error string (must be freed with mcp_free_string)
 #[no_mangle]
 pub extern "C" fn mcp_list_tools_json(_client_ptr: *mut McpClient) -> *mut c_char {
-    // Get global client
-    let global_client_guard = GLOBAL_CLIENT.get()
-        .and_then(|c| Some(c.lock().unwrap()));
-    let client = match global_client_guard.as_ref().and_then(|g| g.as_ref()) {
-        Some(c) => c,
-        None => {
-            let error = r#"{"error": "Not connected. Call mcp_connect() first"}"#;
-            return CString::new(error).unwrap_or_default().into_raw();
+    let (response_tx, response_rx) = mpsc::channel();
+    let runtime = GlobalRuntime::get();
+    
+    if runtime.sender.send(RuntimeCommand::ListTools {
+        response: response_tx,
+    }).is_err() {
+        let error = extract_error_message(r#"{"error": "Failed to send command to runtime"}"#);
+        return CString::new(error).unwrap_or_default().into_raw();
+    }
+    
+    // Wait for response
+    match response_rx.recv() {
+        Ok(Ok(json)) => {
+            CString::new(json).unwrap_or_default().into_raw()
         }
-    };
-
-    let result = client.runtime.block_on(async {
-        let service_guard = client.service.lock().await;
-        let service = match service_guard.as_ref() {
-            Some(s) => s,
-            None => {
-                return r#"{"error": "Not connected to server"}"#.to_string();
-            }
-        };
-
-        match service.list_tools(Default::default()).await {
-            Ok(tools_response) => {
-                let tools_json: Vec<serde_json::Value> = tools_response
-                    .tools
-                    .iter()
-                    .map(|tool| {
-                        serde_json::json!({
-                            "name": tool.name,
-                            "description": tool.description,
-                            "inputSchema": tool.input_schema
-                        })
-                    })
-                    .collect();
-
-                match serde_json::to_string(&serde_json::json!({
-                    "tools": tools_json
-                })) {
-                    Ok(json) => json,
-                    Err(e) => format!(r#"{{"error": "Serialization failed: {}"}}"#, e),
-                }
-            }
-            Err(e) => format!(r#"{{"error": "Failed to list tools: {}"}}"#, e),
+        Ok(Err(err)) => {
+            let error = extract_error_message(&format!(r#"{{"error": "{}"}}"#, err));
+            CString::new(error).unwrap_or_default().into_raw()
         }
-    });
-
-    match CString::new(result) {
-        Ok(c_str) => c_str.into_raw(),
-        Err(_) => ptr::null_mut(),
+        Err(_) => {
+            let error = extract_error_message(r#"{"error": "Runtime communication error"}"#);
+            CString::new(error).unwrap_or_default().into_raw()
+        }
     }
 }
 
-/// Call a tool on the connected MCP server (returns raw JSON)
-/// tool_name: Name of the tool to call
-/// arguments_json: JSON string with tool arguments
-/// Returns: JSON string with tool result (must be freed with mcp_free_string)
+/// Call a tool on the MCP server
+/// Returns JSON response, or error string (must be freed with mcp_free_string)
 #[no_mangle]
 pub extern "C" fn mcp_call_tool_json(
     _client_ptr: *mut McpClient,
     tool_name: *const c_char,
-    arguments_json: *const c_char,
+    arguments: *const c_char,
 ) -> *mut c_char {
-    if tool_name.is_null() || arguments_json.is_null() {
-        let error = r#"{"error": "Invalid arguments"}"#;
+    if tool_name.is_null() || arguments.is_null() {
+        let error = extract_error_message(r#"{"error": "Invalid arguments"}"#);
         return CString::new(error).unwrap_or_default().into_raw();
     }
 
-    let tool_name_str = unsafe {
+    let name = unsafe {
         match CStr::from_ptr(tool_name).to_str() {
             Ok(s) => s.to_string(),
             Err(_) => {
-                let error = r#"{"error": "Invalid tool name"}"#;
+                let error = extract_error_message(r#"{"error": "Invalid tool name"}"#);
                 return CString::new(error).unwrap_or_default().into_raw();
             }
         }
     };
 
-    let arguments_str = unsafe {
-        match CStr::from_ptr(arguments_json).to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                let error = r#"{"error": "Invalid arguments JSON"}"#;
-                return CString::new(error).unwrap_or_default().into_raw();
-            }
-        }
-    };
-
-    let arguments: serde_json::Value = match serde_json::from_str(arguments_str) {
-        Ok(v) => v,
-        Err(e) => {
-            let error = format!(r#"{{"error": "Invalid JSON: {}"}}"#, e);
-            return CString::new(error).unwrap_or_default().into_raw();
-        }
-    };
-
-    // Get global client
-    let global_client_guard = GLOBAL_CLIENT.get()
-        .and_then(|c| Some(c.lock().unwrap()));
-    let client = match global_client_guard.as_ref().and_then(|g| g.as_ref()) {
-        Some(c) => c,
-        None => {
-            let error = r#"{"error": "Not connected. Call mcp_connect() first"}"#;
-            return CString::new(error).unwrap_or_default().into_raw();
-        }
-    };
-
-    let result = client.runtime.block_on(async {
-        let service_guard = client.service.lock().await;
-        let service = match service_guard.as_ref() {
-            Some(s) => s,
-            None => {
-                return r#"{"error": "Not connected to server"}"#.to_string();
-            }
-        };
-
-        let call_param = rmcp::model::CallToolRequestParam {
-            name: std::borrow::Cow::Owned(tool_name_str),
-            arguments: arguments.as_object().cloned(),
-        };
-
-        match service.call_tool(call_param).await {
-            Ok(result) => {
-                match serde_json::to_string(&serde_json::json!({
-                    "result": result
-                })) {
-                    Ok(json) => json,
-                    Err(e) => format!(r#"{{"error": "Serialization failed: {}"}}"#, e),
-                }
-            }
-            Err(e) => format!(r#"{{"error": "Tool call failed: {}"}}"#, e),
-        }
-    });
-
-    match CString::new(result) {
-        Ok(c_str) => c_str.into_raw(),
-        Err(_) => ptr::null_mut(),
-    }
-}
-
-// Streaming API
-use std::sync::Arc;
-use std::collections::HashMap;
-use tokio::sync::Mutex as TokioMutex;
-
-lazy_static::lazy_static! {
-    static ref STREAM_CHANNELS: Arc<TokioMutex<HashMap<usize, tokio::sync::mpsc::UnboundedReceiver<StreamChunk>>>> =
-        Arc::new(TokioMutex::new(HashMap::new()));
-    static ref STREAM_COUNTER: Mutex<usize> = Mutex::new(0);
-}
-
-// FFI-compatible StreamResult struct (must match C definition)
-#[repr(C)]
-pub struct StreamResult {
-    pub result_type: i32,  // 0=tool, 1=text, 2=error, 3=done
-    pub data: *mut c_char,
-}
-
-// Stream type constants (must match C)
-const STREAM_TYPE_TOOL: i32 = 0;
-const STREAM_TYPE_TEXT: i32 = 1;
-const STREAM_TYPE_ERROR: i32 = 2;
-const STREAM_TYPE_DONE: i32 = 3;
-
-// Internal stream chunk enum
-#[derive(Debug, Clone)]
-enum StreamChunk {
-    Tool(serde_json::Value),
-    Text(String),
-    Error(String),
-    Done,
-}
-
-/// Initialize a new list_tools stream
-/// Returns a stream ID that can be used to fetch results
-#[no_mangle]
-pub extern "C" fn mcp_list_tools_init() -> usize {
-    // Get next stream ID
-    let stream_id = {
-        let mut counter = STREAM_COUNTER.lock().unwrap();
-        *counter += 1;
-        *counter
-    };
-
-    // Create unbounded channel for streaming
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-    // Get the global client
-    let client_mutex = GLOBAL_CLIENT.get_or_init(|| Mutex::new(None));
-
-    // Spawn the async task
-    {
-        let client_opt = client_mutex.lock().unwrap();
-        if let Some(client) = client_opt.as_ref() {
-            // Clone the Arc to share the service across async boundaries
-            let service_arc = client.service.clone();
-
-            // Use the client's runtime to spawn the task
-            client.runtime.spawn(async move {
-                let service_guard = service_arc.lock().await;
-                if let Some(service) = service_guard.as_ref() {
-                    match service.list_tools(None).await {
-                        Ok(response) => {
-                            // Send each tool as a separate chunk
-                            for tool in response.tools {
-                                if let Ok(tool_json) = serde_json::to_value(&tool) {
-                                    let _ = tx.send(StreamChunk::Tool(tool_json));
-                                }
-                            }
-                            let _ = tx.send(StreamChunk::Done);
-                        }
-                        Err(e) => {
-                            let _ = tx.send(StreamChunk::Error(format!("Failed to list tools: {}", e)));
-                            let _ = tx.send(StreamChunk::Done);
-                        }
-                    }
-                } else {
-                    // No service connected
-                    let _ = tx.send(StreamChunk::Error("Not connected. Call mcp_connect() first".to_string()));
-                    let _ = tx.send(StreamChunk::Done);
-                }
-            });
-        } else {
-            // No client initialized
-            let _ = tx.send(StreamChunk::Error("Client not initialized".to_string()));
-            let _ = tx.send(StreamChunk::Done);
-        }
-    } // Release the lock here
-
-    // Store the receiver in global storage (now safe to acquire lock again)
-    let client_opt = client_mutex.lock().unwrap();
-    if let Some(client) = client_opt.as_ref() {
-        client.runtime.block_on(async {
-            let mut channels = STREAM_CHANNELS.lock().await;
-            channels.insert(stream_id, rx);
-        });
-    }
-
-    stream_id
-}
-
-/// Initialize a stream for calling a tool and retrieving results
-/// Returns a stream ID that can be used with mcp_stream_next/wait/cleanup
-#[no_mangle]
-pub extern "C" fn mcp_call_tool_init(tool_name: *const c_char, arguments: *const c_char) -> usize {
-    let tool_name_str = unsafe {
-        if tool_name.is_null() {
-            return 0;
-        }
-        match CStr::from_ptr(tool_name).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return 0,
-        }
-    };
-
-    let arguments_str = unsafe {
-        if arguments.is_null() {
-            return 0;
-        }
+    let args = unsafe {
         match CStr::from_ptr(arguments).to_str() {
             Ok(s) => s.to_string(),
-            Err(_) => return 0,
+            Err(_) => {
+                let error = extract_error_message(r#"{"error": "Invalid arguments"}"#);
+                return CString::new(error).unwrap_or_default().into_raw();
+            }
         }
     };
 
-    // Generate unique stream ID
-    let stream_id = {
-        let mut counter = STREAM_COUNTER.lock().unwrap();
-        *counter += 1;
-        *counter
-    };
-
-    // Create unbounded channel for streaming
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-    // Get the global client
-    let client_mutex = GLOBAL_CLIENT.get_or_init(|| Mutex::new(None));
-
-    // Spawn the async task
-    {
-        let client_opt = client_mutex.lock().unwrap();
-        if let Some(client) = client_opt.as_ref() {
-            let service_arc = client.service.clone();
-
-            // Use the client's runtime to spawn the task
-            client.runtime.spawn(async move {
-                let service_guard = service_arc.lock().await;
-                if let Some(service) = service_guard.as_ref() {
-                    // Parse arguments
-                    let arguments_json: serde_json::Value = match serde_json::from_str(&arguments_str) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let _ = tx.send(StreamChunk::Error(format!("Invalid JSON arguments: {}", e)));
-                            let _ = tx.send(StreamChunk::Done);
-                            return;
-                        }
-                    };
-
-                    // Create the call tool parameter
-                    let call_param = rmcp::model::CallToolRequestParam {
-                        name: std::borrow::Cow::Owned(tool_name_str),
-                        arguments: arguments_json.as_object().cloned(),
-                    };
-
-                    // Call the tool
-                    match service.call_tool(call_param).await {
-                        Ok(result) => {
-                            // Serialize the result to JSON and extract text content
-                            if let Ok(result_json) = serde_json::to_value(&result) {
-                                if let Some(content_array) = result_json.get("content").and_then(|v| v.as_array()) {
-                                    for item in content_array {
-                                        if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
-                                            if item_type == "text" {
-                                                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                                                    let _ = tx.send(StreamChunk::Text(text.to_string()));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            let _ = tx.send(StreamChunk::Done);
-                        }
-                        Err(e) => {
-                            let _ = tx.send(StreamChunk::Error(format!("Failed to call tool: {}", e)));
-                            let _ = tx.send(StreamChunk::Done);
-                        }
-                    }
-                } else {
-                    let _ = tx.send(StreamChunk::Error("Not connected. Call mcp_connect() first".to_string()));
-                    let _ = tx.send(StreamChunk::Done);
-                }
-            });
-        } else {
-            let _ = tx.send(StreamChunk::Error("Client not initialized".to_string()));
-            let _ = tx.send(StreamChunk::Done);
+    let (response_tx, response_rx) = mpsc::channel();
+    let runtime = GlobalRuntime::get();
+    
+    if runtime.sender.send(RuntimeCommand::CallTool {
+        name,
+        args,
+        response: response_tx,
+    }).is_err() {
+        let error = extract_error_message(r#"{"error": "Failed to send command to runtime"}"#);
+        return CString::new(error).unwrap_or_default().into_raw();
+    }
+    
+    // Wait for response
+    match response_rx.recv() {
+        Ok(Ok(json)) => {
+            CString::new(json).unwrap_or_default().into_raw()
         }
-    }
-
-    // Store the receiver
-    let client_opt = client_mutex.lock().unwrap();
-    if let Some(client) = client_opt.as_ref() {
-        client.runtime.block_on(async {
-            let mut channels = STREAM_CHANNELS.lock().await;
-            channels.insert(stream_id, rx);
-        });
-    }
-
-    stream_id
-}
-
-/// Try to get the next chunk from a stream (non-blocking)
-/// Returns NULL if no data is available
-#[no_mangle]
-pub extern "C" fn mcp_stream_next(stream_id: usize) -> *mut StreamResult {
-    let client_mutex = GLOBAL_CLIENT.get_or_init(|| Mutex::new(None));
-    let client_opt = client_mutex.lock().unwrap();
-
-    if let Some(client) = client_opt.as_ref() {
-        client.runtime.block_on(async {
-            let mut channels = STREAM_CHANNELS.lock().await;
-            if let Some(rx) = channels.get_mut(&stream_id) {
-                match rx.try_recv() {
-                    Ok(chunk) => {
-                        Box::into_raw(Box::new(chunk_to_stream_result(chunk)))
-                    }
-                    Err(_) => ptr::null_mut(),
-                }
-            } else {
-                ptr::null_mut()
-            }
-        })
-    } else {
-        ptr::null_mut()
-    }
-}
-
-/// Wait for the next chunk from a stream (blocking with timeout)
-/// timeout_ms: Maximum milliseconds to wait
-/// Returns NULL if timeout occurs or stream is closed
-#[no_mangle]
-pub extern "C" fn mcp_stream_wait(stream_id: usize, timeout_ms: u64) -> *mut StreamResult {
-    let client_mutex = GLOBAL_CLIENT.get_or_init(|| Mutex::new(None));
-    let client_opt = client_mutex.lock().unwrap();
-
-    if let Some(client) = client_opt.as_ref() {
-        client.runtime.block_on(async {
-            let mut channels = STREAM_CHANNELS.lock().await;
-            if let Some(rx) = channels.get_mut(&stream_id) {
-                let timeout = tokio::time::Duration::from_millis(timeout_ms);
-                match tokio::time::timeout(timeout, rx.recv()).await {
-                    Ok(Some(chunk)) => {
-                        Box::into_raw(Box::new(chunk_to_stream_result(chunk)))
-                    }
-                    _ => ptr::null_mut(),
-                }
-            } else {
-                ptr::null_mut()
-            }
-        })
-    } else {
-        ptr::null_mut()
-    }
-}
-
-/// Clean up a stream and free its resources
-#[no_mangle]
-pub extern "C" fn mcp_stream_cleanup(stream_id: usize) {
-    let client_mutex = GLOBAL_CLIENT.get_or_init(|| Mutex::new(None));
-    let client_opt = client_mutex.lock().unwrap();
-
-    if let Some(client) = client_opt.as_ref() {
-        client.runtime.block_on(async {
-            let mut channels = STREAM_CHANNELS.lock().await;
-            channels.remove(&stream_id);
-        });
-    }
-}
-
-/// Free a StreamResult returned by mcp_stream_next or mcp_stream_wait
-#[no_mangle]
-pub extern "C" fn mcp_stream_free_result(result: *mut StreamResult) {
-    if result.is_null() {
-        return;
-    }
-    unsafe {
-        let result = Box::from_raw(result);
-        if !result.data.is_null() {
-            let _ = CString::from_raw(result.data);
+        Ok(Err(err)) => {
+            let error = extract_error_message(&format!(r#"{{"error": "{}"}}"#, err));
+            CString::new(error).unwrap_or_default().into_raw()
         }
-    }
-}
-
-// Helper function to convert StreamChunk to StreamResult
-fn chunk_to_stream_result(chunk: StreamChunk) -> StreamResult {
-    match chunk {
-        StreamChunk::Tool(tool_json) => {
-            let json_str = serde_json::to_string(&tool_json).unwrap_or_else(|_| "{}".to_string());
-            let c_str = CString::new(json_str).unwrap_or_else(|_| CString::new("{}").unwrap());
-            StreamResult {
-                result_type: STREAM_TYPE_TOOL,
-                data: c_str.into_raw(),
-            }
-        }
-        StreamChunk::Text(text) => {
-            let c_str = CString::new(text).unwrap_or_else(|_| CString::new("").unwrap());
-            StreamResult {
-                result_type: STREAM_TYPE_TEXT,
-                data: c_str.into_raw(),
-            }
-        }
-        StreamChunk::Error(error) => {
-            let c_str = CString::new(error).unwrap_or_else(|_| CString::new("Unknown error").unwrap());
-            StreamResult {
-                result_type: STREAM_TYPE_ERROR,
-                data: c_str.into_raw(),
-            }
-        }
-        StreamChunk::Done => {
-            StreamResult {
-                result_type: STREAM_TYPE_DONE,
-                data: ptr::null_mut(),
-            }
+        Err(_) => {
+            let error = extract_error_message(r#"{"error": "Runtime communication error"}"#);
+            CString::new(error).unwrap_or_default().into_raw()
         }
     }
 }
