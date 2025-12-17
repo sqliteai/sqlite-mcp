@@ -247,23 +247,27 @@ pub struct McpClient {
     server_url: Mutex<Option<String>>,
 }
 
-/// Get or create the global Tokio runtime and ensure it's entered
+/// Get or create the global Tokio runtime and ensure it's running
 fn get_runtime() -> &'static tokio::runtime::Runtime {
     let runtime = GLOBAL_RUNTIME.get_or_init(|| {
         tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime")
     });
 
-    // On first call, enter the runtime and forget the guard (Windows fix for nested spawns)
-    // This makes the runtime "current" for the entire program duration
+    // On first call, spawn a background thread to keep the runtime active forever (Windows fix)
     RUNTIME_ENTERED.get_or_init(|| {
         // SAFETY: The runtime is stored in a static and lives for the entire program duration
-        let guard = unsafe {
+        unsafe {
             let runtime_ptr: *const tokio::runtime::Runtime = runtime;
             let runtime_ref: &'static tokio::runtime::Runtime = &*runtime_ptr;
-            runtime_ref.enter()
-        };
-        // Forget the guard so it never gets dropped - keeps runtime as current forever
-        std::mem::forget(guard);
+
+            // Spawn a background thread that keeps the runtime active
+            std::thread::spawn(move || {
+                runtime_ref.block_on(async {
+                    // Keep this future running forever to maintain runtime context
+                    std::future::pending::<()>().await
+                });
+            });
+        }
     });
 
     runtime
