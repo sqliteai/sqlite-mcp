@@ -18,6 +18,9 @@ use serde_json;
 // Global runtime - one runtime per process that stays alive
 static GLOBAL_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
+// Global runtime enter guard - keeps runtime as current for the entire process (Windows fix)
+static GLOBAL_RUNTIME_GUARD: OnceLock<Mutex<Option<tokio::runtime::EnterGuard<'static>>>> = OnceLock::new();
+
 // Global client instance - one client per process
 static GLOBAL_CLIENT: OnceLock<Mutex<Option<McpClient>>> = OnceLock::new();
 
@@ -244,11 +247,24 @@ pub struct McpClient {
     server_url: Mutex<Option<String>>,
 }
 
-/// Get or create the global Tokio runtime
+/// Get or create the global Tokio runtime and ensure it's entered
 fn get_runtime() -> &'static tokio::runtime::Runtime {
-    GLOBAL_RUNTIME.get_or_init(|| {
+    let runtime = GLOBAL_RUNTIME.get_or_init(|| {
         tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime")
-    })
+    });
+
+    // On first call, enter the runtime and keep the guard alive forever (Windows fix for nested spawns)
+    GLOBAL_RUNTIME_GUARD.get_or_init(|| {
+        // SAFETY: The runtime is stored in a static and lives for the entire program duration
+        let guard = unsafe {
+            let runtime_ptr: *const tokio::runtime::Runtime = runtime;
+            let runtime_ref: &'static tokio::runtime::Runtime = &*runtime_ptr;
+            runtime_ref.enter()
+        };
+        Mutex::new(Some(guard))
+    });
+
+    runtime
 }
 
 /// Create a new MCP client
