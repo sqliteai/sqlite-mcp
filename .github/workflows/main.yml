@@ -207,7 +207,7 @@ jobs:
           echo "::endgroup::"
 
       - name: run mcp test server
-        if: ( matrix.name == 'android' && matrix.arch == 'x86_64' ) || ( matrix.name == 'linux' && matrix.arch == 'x86_64' ) || matrix.name == 'windows' || ( matrix.name == 'macos' && matrix.arch != 'x86_64' )
+        if: ( matrix.name == 'android' && matrix.arch == 'x86_64' ) || ( matrix.name == 'linux' && matrix.arch == 'x86_64' ) || ( matrix.name == 'macos' && matrix.arch != 'x86_64' )
         run: npx @playwright/mcp@latest --port 8931 --headless & sleep 10
 
       - name: android test sqlite-mcp
@@ -225,11 +225,11 @@ jobs:
             adb shell "cd /data/local/tmp && sqlite3 \":memory:\" -cmd \".bail on\" \".load ./dist/mcp\" \"SELECT mcp_version();\" && ./android-test"
 
       - name: load test only sqlite-mcp
-        if: matrix.name == 'linux-musl' || ( matrix.name == 'linux' && matrix.arch == 'arm64' )
+        if: matrix.name == 'linux-musl' || ( matrix.name == 'linux' && matrix.arch == 'arm64' ) || matrix.name == 'windows'
         run: ${{ matrix.name == 'linux-musl' && matrix.arch == 'arm64' && 'docker exec alpine' || '' }} sqlite3 ":memory:" -cmd ".bail on" ".load ./dist/mcp" "SELECT mcp_version();"
 
       - name: test sqlite-mcp
-        if: ( matrix.name == 'linux' && matrix.arch == 'x86_64' ) || matrix.name == 'windows' || ( matrix.name == 'macos' && matrix.arch != 'x86_64' )
+        if: ( matrix.name == 'linux' && matrix.arch == 'x86_64' ) || ( matrix.name == 'macos' && matrix.arch != 'x86_64' )
         run: make test ${{ matrix.make && matrix.make || ''}}
 
       - uses: actions/upload-artifact@v4.6.2
