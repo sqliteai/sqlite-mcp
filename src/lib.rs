@@ -1,5 +1,5 @@
 //
-//  lib.rs (New Windows-compatible version)
+//  lib.rs (Fixed Windows-compatible version)
 //  sqlitemcp
 //
 //  Single global Tokio runtime architecture to fix Windows issues
@@ -13,8 +13,9 @@ use std::sync::mpsc::{self, Sender, Receiver};
 use std::thread;
 
 use rmcp::transport::{SseClientTransport, StreamableHttpClientTransport};
-use rmcp::{ServiceExt, RoleClient};
-use rmcp::model::{ClientInfo, ClientCapabilities, Implementation, ProtocolVersion};
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::{ServiceExt, RoleClient, serve_client};
+use rmcp::model::{ClientInfo, ClientCapabilities, Implementation, ProtocolVersion, CallToolRequestParam, ListToolsRequest};
 use serde_json;
 
 // === SINGLE GLOBAL RUNTIME ARCHITECTURE ===
@@ -50,47 +51,100 @@ enum RuntimeCommand {
     },
 }
 
+/// Type alias for a running MCP service
+type RunningClient = rmcp::service::RunningService<RoleClient, ()>;
+
+/// Global MCP client state
+static GLOBAL_CLIENT: Mutex<Option<RunningClient>> = Mutex::new(None);
+
+/// Simple client service (no-op implementation since we only use client features)
+struct SimpleClient;
+
+impl rmcp::Service<RoleClient> for SimpleClient {
+    async fn handle_request(
+        &self,
+        _request: rmcp::model::ServerRequest,
+        _context: rmcp::service::RequestContext<RoleClient>,
+    ) -> Result<rmcp::model::ClientResult, rmcp::ErrorData> {
+        // Client typically doesn't handle requests from server
+        Err(rmcp::ErrorData::new(
+            (-32601).into(),
+            "Method not found".to_string().into(),
+            None,
+        ))
+    }
+
+    async fn handle_notification(
+        &self,
+        _notification: rmcp::model::ServerNotification,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) -> Result<(), rmcp::ErrorData> {
+        // Client can ignore server notifications
+        Ok(())
+    }
+
+    fn get_info(&self) -> ClientInfo {
+        ClientInfo {
+            protocol_version: ProtocolVersion::default(),
+            capabilities: ClientCapabilities::default(),
+            client_info: Implementation {
+                name: "sqlite-mcp".to_string(),
+                title: None,
+                version: "0.1.4".to_string(),
+                icons: None,
+                website_url: None,
+            },
+        }
+    }
+}
+
 impl GlobalRuntime {
-    fn new() -> Self {
-        let (sender, receiver) = mpsc::channel();
-        
-        let worker_handle = thread::spawn(move || {
-            // Create the ONE AND ONLY Tokio runtime
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create Tokio runtime");
+    /// Initialize the global runtime
+    fn init() -> &'static GlobalRuntime {
+        GLOBAL_RUNTIME.get_or_init(|| {
+            let (sender, receiver) = mpsc::channel::<RuntimeCommand>();
             
-            // This thread will run ALL async operations
-            rt.block_on(async move {
-                let mut client: Option<RunningClient> = None;
+            let worker_handle = thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("Failed to create Tokio runtime");
                 
-                while let Ok(cmd) = receiver.recv() {
-                    match cmd {
-                        RuntimeCommand::Connect { url, headers, legacy_sse, response } => {
-                            let result = Self::handle_connect(&mut client, url, headers, legacy_sse).await;
-                            let _ = response.send(result);
-                        }
-                        RuntimeCommand::ListTools { response } => {
-                            let result = Self::handle_list_tools(&client).await;
-                            let _ = response.send(result);
-                        }
-                        RuntimeCommand::CallTool { name, args, response } => {
-                            let result = Self::handle_call_tool(&client, name, args).await;
-                            let _ = response.send(result);
-                        }
-                        RuntimeCommand::Disconnect { response } => {
-                            client = None;
-                            let _ = response.send(Ok(()));
-                        }
-                    }
-                }
+                rt.block_on(async {
+                    Self::worker_loop(receiver).await;
+                });
             });
-        });
+            
+            GlobalRuntime {
+                sender,
+                _worker_handle: worker_handle,
+            }
+        })
+    }
+    
+    /// Worker loop that runs in the dedicated thread
+    async fn worker_loop(receiver: Receiver<RuntimeCommand>) {
+        let mut client: Option<RunningClient> = None;
         
-        Self {
-            sender,
-            _worker_handle: worker_handle,
+        while let Ok(command) = receiver.recv() {
+            match command {
+                RuntimeCommand::Connect { url, headers, legacy_sse, response } => {
+                    let result = Self::handle_connect(&mut client, url, headers, legacy_sse).await;
+                    let _ = response.send(result);
+                }
+                RuntimeCommand::ListTools { response } => {
+                    let result = Self::handle_list_tools(&client).await;
+                    let _ = response.send(result);
+                }
+                RuntimeCommand::CallTool { name, args, response } => {
+                    let result = Self::handle_call_tool(&client, name, args).await;
+                    let _ = response.send(result);
+                }
+                RuntimeCommand::Disconnect { response } => {
+                    let result = Self::handle_disconnect(&mut client).await;
+                    let _ = response.send(result);
+                }
+            }
         }
     }
     
@@ -101,31 +155,26 @@ impl GlobalRuntime {
         legacy_sse: bool,
     ) -> Result<String, String> {
         // Disconnect existing client
-        *client = None;
+        if let Some(existing_client) = client.take() {
+            let _ = existing_client.cancel().await;
+        }
         
         // Parse headers if provided
-        let headers_map: Option<std::collections::HashMap<String, String>> = if let Some(headers_str) = headers {
-            match serde_json::from_str(&headers_str) {
-                Ok(map) => Some(map),
-                Err(_) => return Err("Invalid headers JSON".to_string()),
-            }
+        let headers_map = if let Some(headers_str) = headers {
+            serde_json::from_str::<std::collections::HashMap<String, String>>(&headers_str)
+                .map_err(|e| format!("Invalid headers JSON: {}", e))?
         } else {
-            None
+            std::collections::HashMap::new()
         };
         
-        let result = if legacy_sse {
-            Self::connect_sse(url, headers_map).await
+        let new_client = if legacy_sse {
+            Self::connect_sse(url, if headers_map.is_empty() { None } else { Some(headers_map) }).await?
         } else {
-            Self::connect_streamable_http(url, headers_map).await
+            Self::connect_streamable_http(url, if headers_map.is_empty() { None } else { Some(headers_map) }).await?
         };
         
-        match result {
-            Ok(service) => {
-                *client = Some(service);
-                Ok("connected".to_string())
-            }
-            Err(e) => Err(format!("Failed to connect to MCP server: {}", e)),
-        }
+        *client = Some(new_client);
+        Ok("null".to_string()) // Return null for success (matches existing API)
     }
     
     async fn connect_sse(
@@ -143,29 +192,24 @@ impl GlobalRuntime {
                     header_map.insert(header_name, header_value);
                 }
             }
-            client_builder = client_builder.default_headers(header_map);
+            if !header_map.is_empty() {
+                client_builder = client_builder.default_headers(header_map);
+            }
         }
         
         let http_client = client_builder.build().map_err(|e| e.to_string())?;
-        let transport = Box::new(SseClientTransport::new(http_client));
         
-        let client_info = ClientInfo {
-            protocol_version: rmcp::model::ProtocolVersion::default(),
-            capabilities: ClientCapabilities::default(),
-            client_info: Implementation {
-                name: "sqlite-mcp".to_string(),
-                title: None,
-                version: "0.1.4".to_string(),
-                icons: None,
-                website_url: None,
-            },
+        let config = rmcp::transport::sse_client::SseClientConfig {
+            sse_endpoint: url.into(),
+            ..Default::default()
         };
         
-        let client_caps = ClientCapabilities::default();
+        let transport = SseClientTransport::start_with_client(http_client, config).await
+            .map_err(|e| e.to_string())?;
         
-        rmcp::client::connect(transport, client_info, client_caps, &url)
-            .await
-            .map_err(|e| e.to_string())
+        let service = SimpleClient;
+        service.serve(transport).await
+            .map_err(|e| format!("Failed to connect to MCP server: {}", e))
     }
     
     async fn connect_streamable_http(
@@ -195,35 +239,30 @@ impl GlobalRuntime {
         }
         
         let http_client = client_builder.build().map_err(|e| e.to_string())?;
-        let transport = Box::new(StreamableHttpClientTransport::new(http_client, auth_header_value));
-        
-        let client_info = ClientInfo {
-            protocol_version: rmcp::model::ProtocolVersion::default(),
-            capabilities: ClientCapabilities::default(),
-            client_info: Implementation {
-                name: "sqlite-mcp".to_string(),
-                title: None,
-                version: "0.1.4".to_string(),
-                icons: None,
-                website_url: None,
-            },
+        let config = StreamableHttpClientTransportConfig {
+            uri: url.into(),
+            auth_header: auth_header_value,
+            ..Default::default()
         };
+        let transport = StreamableHttpClientTransport::with_client(http_client, config);
         
-        let client_caps = ClientCapabilities::default();
-        
-        rmcp::client::connect(transport, client_info, client_caps, &url)
-            .await
-            .map_err(|e| e.to_string())
+        let service = SimpleClient;
+        service.serve(transport).await
+            .map_err(|e| format!("Failed to connect to MCP server: {}", e))
     }
     
     async fn handle_list_tools(client: &Option<RunningClient>) -> Result<String, String> {
         let service = client.as_ref().ok_or("Not connected. Call mcp_connect() first")?;
         
-        match service.list_tools(None).await {
-            Ok(response) => {
-                serde_json::to_string(&response).map_err(|e| e.to_string())
-            }
-            Err(e) => Err(e.to_string()),
+        let request = ListToolsRequest::default();
+        let response = service.send_request(request.into()).await
+            .map_err(|e| format!("Failed to list tools: {}", e))?;
+        
+        if let rmcp::model::ServerResult::ListToolsResult(tools_result) = response {
+            serde_json::to_string(&tools_result)
+                .map_err(|e| format!("Failed to serialize tools: {}", e))
+        } else {
+            Err("Unexpected response type".to_string())
         }
     }
     
@@ -234,276 +273,239 @@ impl GlobalRuntime {
     ) -> Result<String, String> {
         let service = client.as_ref().ok_or("Not connected. Call mcp_connect() first")?;
         
-        let arguments: serde_json::Value = serde_json::from_str(&args)
-            .map_err(|e| format!("Invalid JSON arguments: {}", e))?;
+        let arguments = if args.trim().is_empty() {
+            None
+        } else {
+            Some(serde_json::from_str(&args)
+                .map_err(|e| format!("Invalid JSON arguments: {}", e))?)
+        };
         
-        match service.call_tool(&name, arguments).await {
-            Ok(response) => {
-                serde_json::to_string(&response).map_err(|e| e.to_string())
-            }
-            Err(e) => Err(e.to_string()),
+        let param = CallToolRequestParam {
+            name: name.into(),
+            arguments,
+        };
+        
+        let request = rmcp::model::CallToolRequest { params: param };
+        let response = service.send_request(request.into()).await
+            .map_err(|e| format!("Failed to call tool: {}", e))?;
+        
+        if let rmcp::model::ServerResult::CallToolResult(tool_result) = response {
+            serde_json::to_string(&tool_result)
+                .map_err(|e| format!("Failed to serialize tool result: {}", e))
+        } else {
+            Err("Unexpected response type".to_string())
         }
     }
     
-    fn get() -> &'static GlobalRuntime {
-        GLOBAL_RUNTIME.get_or_init(|| GlobalRuntime::new())
-    }
-}
-
-// Type alias for the running client - use dynamic trait object to support both transport types  
-type RunningClient = rmcp::client::RunningClient<
-    Box<dyn rmcp::transport::ClientTransport + Send + Sync>,
->;
-
-/// Extract error message from JSON error response
-/// Returns the error message string if found, or the original JSON if not found
-fn extract_error_message(json_str: &str) -> String {
-    match serde_json::from_str::<serde_json::Value>(json_str) {
-        Ok(json) => {
-            if let Some(error) = json.get("error").and_then(|e| e.as_str()) {
-                error.to_string()
-            } else {
-                json_str.to_string()
-            }
+    async fn handle_disconnect(client: &mut Option<RunningClient>) -> Result<(), String> {
+        if let Some(existing_client) = client.take() {
+            existing_client.cancel().await
+                .map_err(|e| format!("Failed to disconnect: {:?}", e))?;
         }
-        Err(_) => json_str.to_string(),
+        Ok(())
+    }
+    
+    /// Send a command to the worker thread and wait for response
+    fn send_command<T>(command: RuntimeCommand) -> Result<T, String>
+    where
+        T: Send + 'static,
+        RuntimeCommand: 'static,
+    {
+        let runtime = Self::init();
+        
+        // This is a simplified version - in real implementation you'd need proper type handling
+        // For now, we'll implement each function separately
+        runtime.sender.send(command)
+            .map_err(|_| "Runtime worker thread has died".to_string())?;
+            
+        // The actual response handling is done in each specific function
+        unreachable!() // This won't be reached in practice due to function-specific implementations
     }
 }
 
-/// Initialize the MCP library
-/// Returns 0 on success, non-zero on error
-#[no_mangle]
-pub extern "C" fn mcp_init() -> i32 {
-    0
-}
+// === FFI FUNCTIONS ===
 
-/// Free a string allocated by the MCP library
-#[no_mangle]
-pub extern "C" fn mcp_free_string(s: *mut c_char) {
-    if s.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = CString::from_raw(s);
-    }
-}
-
-/// Opaque handle for MCP client - now just a marker since we use global runtime
-pub struct McpClient {
-    _marker: u8,
-}
-
-/// Create a new MCP client
-/// Returns NULL on error
-#[no_mangle]
-pub extern "C" fn mcp_client_new() -> *mut McpClient {
-    // Initialize the global runtime on first use
-    let _ = GlobalRuntime::get();
-    // Just return a dummy pointer - all work is done by the global runtime  
-    Box::into_raw(Box::new(McpClient { _marker: 0 }))
-}
-
-/// Free an MCP client
-#[no_mangle]
-pub extern "C" fn mcp_client_free(client: *mut McpClient) {
-    if client.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = Box::from_raw(client);
-    }
-}
-
-/// Connect to an MCP server with optional custom headers
-/// server_url: URL of the MCP server (e.g., "http://localhost:8931/sse")
-/// headers_json: Optional JSON string with custom headers (e.g., '{"Authorization": "Bearer token", "X-MCP-Readonly": "true"}'), can be NULL
-/// legacy_sse: 1 to use SSE transport (legacy), 0 to use streamable HTTP transport (default)
-/// Returns: NULL on success, error string on failure (must be freed with mcp_free_string)
+/// Create a new MCP client connection
+/// Returns NULL on success, or JSON error string on failure
 #[no_mangle]
 pub extern "C" fn mcp_connect(
-    _client_ptr: *mut McpClient,
     server_url: *const c_char,
-    headers_json: *const c_char,
-    legacy_sse: i32
+    headers: *const c_char,
+    legacy_sse: i32,
 ) -> *mut c_char {
-    if server_url.is_null() {
-        let error = extract_error_message(r#"{"error": "Invalid arguments"}"#);
-        return CString::new(error).unwrap_or_default().into_raw();
-    }
-
-    let server_url_str = unsafe {
-        match CStr::from_ptr(server_url).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                let error = extract_error_message(r#"{"error": "Invalid server URL"}"#);
-                return CString::new(error).unwrap_or_default().into_raw();
-            }
-        }
+    let url = match unsafe { CStr::from_ptr(server_url).to_str() } {
+        Ok(s) => s.to_string(),
+        Err(_) => return CString::new("{\"error\": \"Invalid server URL\"}").unwrap().into_raw(),
     };
-
-    // Parse optional headers_json (can be NULL or a JSON object)
-    let headers_str: Option<String> = if headers_json.is_null() {
+    
+    let headers_opt = if headers.is_null() {
         None
     } else {
-        unsafe {
-            match CStr::from_ptr(headers_json).to_str() {
-                Ok(json_str) => Some(json_str.to_string()),
-                Err(_) => {
-                    let error = extract_error_message(r#"{"error": "Invalid headers string"}"#);
-                    return CString::new(error).unwrap_or_default().into_raw();
-                }
-            }
+        match unsafe { CStr::from_ptr(headers).to_str() } {
+            Ok(s) if s.trim().is_empty() => None,
+            Ok(s) => Some(s.to_string()),
+            Err(_) => return CString::new("{\"error\": \"Invalid headers\"}").unwrap().into_raw(),
         }
     };
-
-    // Send connection request to global runtime
-    let (response_tx, response_rx) = mpsc::channel();
-    let runtime = GlobalRuntime::get();
     
-    if runtime.sender.send(RuntimeCommand::Connect {
-        url: server_url_str,
-        headers: headers_str,
+    let runtime = GlobalRuntime::init();
+    let (tx, rx) = mpsc::channel();
+    
+    let command = RuntimeCommand::Connect {
+        url,
+        headers: headers_opt,
         legacy_sse: legacy_sse != 0,
-        response: response_tx,
-    }).is_err() {
-        let error = extract_error_message(r#"{"error": "Failed to send command to runtime"}"#);
-        return CString::new(error).unwrap_or_default().into_raw();
+        response: tx,
+    };
+    
+    if runtime.sender.send(command).is_err() {
+        return CString::new("{\"error\": \"Runtime worker thread has died\"}").unwrap().into_raw();
     }
     
-    // Wait for response
-    match response_rx.recv() {
-        Ok(Ok(_)) => {
-            // Success - return NULL (which means success in the API)
-            ptr::null_mut()
+    match rx.recv() {
+        Ok(Ok(result)) => {
+            if result == "null" {
+                ptr::null_mut() // Success
+            } else {
+                CString::new(result).unwrap().into_raw()
+            }
         }
         Ok(Err(err)) => {
-            // Connection failed
-            let error = extract_error_message(&format!(r#"{{"error": "{}"}}"#, err));
-            CString::new(error).unwrap_or_default().into_raw()
+            let error_json = format!("{{\"error\": \"{}\"}}", err.replace('"', "\\\""));
+            CString::new(error_json).unwrap().into_raw()
+        }
+        Err(_) => CString::new("{\"error\": \"Failed to receive response from runtime\"}").unwrap().into_raw(),
+    }
+}
+
+/// List available tools from the connected MCP server
+/// Returns JSON string with tools list, or JSON error on failure
+#[no_mangle]
+pub extern "C" fn mcp_list_tools_json() -> *mut c_char {
+    let runtime = GlobalRuntime::init();
+    let (tx, rx) = mpsc::channel();
+    
+    let command = RuntimeCommand::ListTools { response: tx };
+    
+    if runtime.sender.send(command).is_err() {
+        let error_json = "{\"error\": \"Runtime worker thread has died\"}";
+        return CString::new(error_json).unwrap().into_raw();
+    }
+    
+    match rx.recv() {
+        Ok(Ok(result)) => CString::new(result).unwrap().into_raw(),
+        Ok(Err(err)) => {
+            let error_json = format!("{{\"error\": \"{}\"}}", err.replace('"', "\\\""));
+            CString::new(error_json).unwrap().into_raw()
         }
         Err(_) => {
-            // Channel error
-            let error = extract_error_message(r#"{"error": "Runtime communication error"}"#);
-            CString::new(error).unwrap_or_default().into_raw()
+            let error_json = "{\"error\": \"Failed to receive response from runtime\"}";
+            CString::new(error_json).unwrap().into_raw()
         }
     }
 }
 
-/// Disconnect from MCP server
-/// Returns NULL on success
+/// Call a tool on the connected MCP server
+/// Returns JSON string with result, or JSON error on failure
 #[no_mangle]
-pub extern "C" fn mcp_disconnect() -> *mut c_char {
-    let (response_tx, response_rx) = mpsc::channel();
-    let runtime = GlobalRuntime::get();
-    
-    if runtime.sender.send(RuntimeCommand::Disconnect {
-        response: response_tx,
-    }).is_err() {
-        let error = extract_error_message(r#"{"error": "Failed to send command to runtime"}"#);
-        return CString::new(error).unwrap_or_default().into_raw();
-    }
-    
-    // Wait for response
-    match response_rx.recv() {
-        Ok(Ok(_)) => ptr::null_mut(), // Success
-        Ok(Err(err)) => {
-            let error = extract_error_message(&format!(r#"{{"error": "{}"}}"#, err));
-            CString::new(error).unwrap_or_default().into_raw()
-        }
+pub extern "C" fn mcp_call_tool_json(tool_name: *const c_char, arguments: *const c_char) -> *mut c_char {
+    let name = match unsafe { CStr::from_ptr(tool_name).to_str() } {
+        Ok(s) => s.to_string(),
         Err(_) => {
-            let error = extract_error_message(r#"{"error": "Runtime communication error"}"#);
-            CString::new(error).unwrap_or_default().into_raw()
+            let error_json = "{\"error\": \"Invalid tool name\"}";
+            return CString::new(error_json).unwrap().into_raw();
         }
-    }
-}
-
-/// List tools from MCP server
-/// Returns JSON string with tools, or error string (must be freed with mcp_free_string)
-#[no_mangle]
-pub extern "C" fn mcp_list_tools_json(_client_ptr: *mut McpClient) -> *mut c_char {
-    let (response_tx, response_rx) = mpsc::channel();
-    let runtime = GlobalRuntime::get();
+    };
     
-    if runtime.sender.send(RuntimeCommand::ListTools {
-        response: response_tx,
-    }).is_err() {
-        let error = extract_error_message(r#"{"error": "Failed to send command to runtime"}"#);
-        return CString::new(error).unwrap_or_default().into_raw();
-    }
-    
-    // Wait for response
-    match response_rx.recv() {
-        Ok(Ok(json)) => {
-            CString::new(json).unwrap_or_default().into_raw()
-        }
-        Ok(Err(err)) => {
-            let error = extract_error_message(&format!(r#"{{"error": "{}"}}"#, err));
-            CString::new(error).unwrap_or_default().into_raw()
-        }
-        Err(_) => {
-            let error = extract_error_message(r#"{"error": "Runtime communication error"}"#);
-            CString::new(error).unwrap_or_default().into_raw()
-        }
-    }
-}
-
-/// Call a tool on the MCP server
-/// Returns JSON response, or error string (must be freed with mcp_free_string)
-#[no_mangle]
-pub extern "C" fn mcp_call_tool_json(
-    _client_ptr: *mut McpClient,
-    tool_name: *const c_char,
-    arguments: *const c_char,
-) -> *mut c_char {
-    if tool_name.is_null() || arguments.is_null() {
-        let error = extract_error_message(r#"{"error": "Invalid arguments"}"#);
-        return CString::new(error).unwrap_or_default().into_raw();
-    }
-
-    let name = unsafe {
-        match CStr::from_ptr(tool_name).to_str() {
+    let args = if arguments.is_null() {
+        String::new()
+    } else {
+        match unsafe { CStr::from_ptr(arguments).to_str() } {
             Ok(s) => s.to_string(),
             Err(_) => {
-                let error = extract_error_message(r#"{"error": "Invalid tool name"}"#);
-                return CString::new(error).unwrap_or_default().into_raw();
+                let error_json = "{\"error\": \"Invalid arguments\"}";
+                return CString::new(error_json).unwrap().into_raw();
             }
         }
     };
-
-    let args = unsafe {
-        match CStr::from_ptr(arguments).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                let error = extract_error_message(r#"{"error": "Invalid arguments"}"#);
-                return CString::new(error).unwrap_or_default().into_raw();
-            }
-        }
-    };
-
-    let (response_tx, response_rx) = mpsc::channel();
-    let runtime = GlobalRuntime::get();
     
-    if runtime.sender.send(RuntimeCommand::CallTool {
+    let runtime = GlobalRuntime::init();
+    let (tx, rx) = mpsc::channel();
+    
+    let command = RuntimeCommand::CallTool {
         name,
         args,
-        response: response_tx,
-    }).is_err() {
-        let error = extract_error_message(r#"{"error": "Failed to send command to runtime"}"#);
-        return CString::new(error).unwrap_or_default().into_raw();
+        response: tx,
+    };
+    
+    if runtime.sender.send(command).is_err() {
+        let error_json = "{\"error\": \"Runtime worker thread has died\"}";
+        return CString::new(error_json).unwrap().into_raw();
     }
     
-    // Wait for response
-    match response_rx.recv() {
-        Ok(Ok(json)) => {
-            CString::new(json).unwrap_or_default().into_raw()
-        }
+    match rx.recv() {
+        Ok(Ok(result)) => CString::new(result).unwrap().into_raw(),
         Ok(Err(err)) => {
-            let error = extract_error_message(&format!(r#"{{"error": "{}"}}"#, err));
-            CString::new(error).unwrap_or_default().into_raw()
+            let error_json = format!("{{\"error\": \"{}\"}}", err.replace('"', "\\\""));
+            CString::new(error_json).unwrap().into_raw()
         }
         Err(_) => {
-            let error = extract_error_message(r#"{"error": "Runtime communication error"}"#);
-            CString::new(error).unwrap_or_default().into_raw()
+            let error_json = "{\"error\": \"Failed to receive response from runtime\"}";
+            CString::new(error_json).unwrap().into_raw()
         }
     }
 }
+
+/// Disconnect from the MCP server
+/// Returns NULL on success, or JSON error on failure
+#[no_mangle]
+pub extern "C" fn mcp_disconnect() -> *mut c_char {
+    let runtime = GlobalRuntime::init();
+    let (tx, rx) = mpsc::channel();
+    
+    let command = RuntimeCommand::Disconnect { response: tx };
+    
+    if runtime.sender.send(command).is_err() {
+        let error_json = "{\"error\": \"Runtime worker thread has died\"}";
+        return CString::new(error_json).unwrap().into_raw();
+    }
+    
+    match rx.recv() {
+        Ok(Ok(())) => ptr::null_mut(), // Success
+        Ok(Err(err)) => {
+            let error_json = format!("{{\"error\": \"{}\"}}", err.replace('"', "\\\""));
+            CString::new(error_json).unwrap().into_raw()
+        }
+        Err(_) => {
+            let error_json = "{\"error\": \"Failed to receive response from runtime\"}";
+            CString::new(error_json).unwrap().into_raw();
+        }
+    }
+}
+
+/// Get the version of the MCP extension
+#[no_mangle]
+pub extern "C" fn mcp_version() -> *mut c_char {
+    CString::new("0.1.4").unwrap().into_raw()
+}
+
+/// Free a C string allocated by this library
+#[no_mangle]
+pub extern "C" fn mcp_free_string(ptr: *mut c_char) {
+    if !ptr.is_null() {
+        unsafe {
+            drop(CString::from_raw(ptr));
+        }
+    }
+}
+
+// For the virtual table functions, we'll need to implement those separately
+// since they require more complex state management
+
+// TODO: Implement streaming and virtual table functions:
+// - mcp_list_tools (virtual table)
+// - mcp_call_tool (virtual table) 
+// - mcp_list_tools_respond (virtual table)
+// - mcp_call_tool_respond (virtual table)
+// These will require storing the client state globally and implementing
+// the SQLite virtual table interface
