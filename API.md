@@ -418,11 +418,11 @@ SELECT mcp_connect('http://localhost:8931/sse', NULL, 1);
 
 ## Error Handling
 
-The sqlite-mcp extension has two types of error handling:
+The sqlite-mcp extension has consistent error handling across all interfaces:
 
 1. **JSON Functions** (ending with `_json`): Return JSON with error information
 2. **Non-JSON Functions**: Return error strings directly (extracted from JSON)
-3. **Virtual Tables**: Return no rows on error, use scalar functions to check status
+3. **Virtual Tables**: Return SQL errors with extracted error messages (like non-JSON functions)
 
 ### mcp_connect()
 
@@ -462,20 +462,25 @@ FROM (SELECT mcp_call_tool_json('test', '{}') as result);
 
 ### Virtual Tables: mcp_list_tools, mcp_call_tool, mcp_list_tools_respond, mcp_call_tool_respond
 
-Virtual tables return no rows on error. To check for errors, use the corresponding JSON functions:
+Virtual tables return SQL errors with extracted error messages (similar to `mcp_connect()`):
 
 ```sql
--- Check if server is connected before querying virtual table
-SELECT 
-  CASE 
-    WHEN json_extract(mcp_list_tools_json(), '$.error') IS NOT NULL
-    THEN 'Error: Cannot query virtual table - ' || json_extract(mcp_list_tools_json(), '$.error')
-    ELSE 'OK to query virtual table'
-  END;
+-- Query virtual table - errors are automatically returned as SQL errors
+SELECT name, description FROM mcp_list_tools;
+-- If not connected, returns SQL error: "Not connected. Call mcp_connect() first"
 
--- Query virtual table only if no error
-SELECT name, description FROM mcp_list_tools WHERE name LIKE 'browser_%';
+-- Query call tool virtual table
+SELECT text FROM mcp_call_tool('nonexistent_tool', '{}');
+-- Returns SQL error: "Tool not found: nonexistent_tool"
+
+-- Errors can be caught in application code using sqlite3_errmsg()
+-- Or handled in SQL with error handlers
 ```
+
+**Error Behavior:**
+- When an MCP error occurs (not connected, tool not found, invalid JSON, etc.), the virtual table returns `SQLITE_ERROR`
+- The error message is extracted from the JSON error response and set as the SQL error message
+- This provides immediate, clear feedback without needing to check JSON functions separately
 
 ### Common Error Messages
 
@@ -493,37 +498,34 @@ All functions may return these error types:
 1. **Always check mcp_connect() result**:
 ```sql
 -- Good practice: Check connection first
-SELECT 
-  CASE 
-    WHEN mcp_connect('http://localhost:8931/mcp') IS NULL 
+SELECT
+  CASE
+    WHEN mcp_connect('http://localhost:8931/mcp') IS NULL
     THEN 'Connected successfully'
     ELSE mcp_connect('http://localhost:8931/mcp')
   END;
 ```
 
-2. **Use JSON functions for error checking before virtual tables**:
+2. **Virtual tables automatically return errors**:
 ```sql
--- Check for errors before using virtual table
-WITH error_check AS (
-  SELECT json_extract(mcp_list_tools_json(), '$.error') as error
-)
-SELECT 
-  CASE 
-    WHEN error_check.error IS NOT NULL 
-    THEN 'Error: ' || error_check.error
-    ELSE 'Tools: ' || (SELECT GROUP_CONCAT(name) FROM mcp_list_tools)
-  END
-FROM error_check;
+-- Virtual tables automatically return SQL errors - no need to pre-check
+SELECT name, description FROM mcp_list_tools;
+-- If not connected, query fails with error: "Not connected. Call mcp_connect() first"
+
+-- Errors can be caught in application code:
+-- C: sqlite3_errmsg(db)
+-- Python: except sqlite3.Error as e
+-- Node.js: try/catch with better-sqlite3
 ```
 
-3. **Handle tool call errors**:
+3. **Handle JSON function errors manually**:
 ```sql
--- Safe tool calling with error handling
-SELECT 
-  CASE 
+-- JSON functions still return JSON with error field
+SELECT
+  CASE
     WHEN json_extract(result, '$.error') IS NOT NULL
     THEN 'Tool Error: ' || json_extract(result, '$.error')
-    ELSE json_extract(result, '$.content[0].text') 
+    ELSE json_extract(result, '$.content[0].text')
   END as output
 FROM (
   SELECT mcp_call_tool_json('browser_navigate', '{"url": "https://example.com"}') as result

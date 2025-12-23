@@ -51,6 +51,39 @@ pub extern "C" fn mcp_free_string(s: *mut c_char) {
     }
 }
 
+/// Extract error message from JSON error response
+/// Returns the error message string if found, or NULL if no error
+#[no_mangle]
+pub extern "C" fn mcp_extract_error_message(json_str: *const c_char) -> *mut c_char {
+    if json_str.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let json_string = unsafe {
+        match CStr::from_ptr(json_str).to_str() {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        }
+    };
+
+    // Check if this is an error JSON
+    match serde_json::from_str::<serde_json::Value>(json_string) {
+        Ok(json) => {
+            if let Some(error) = json.get("error").and_then(|e| e.as_str()) {
+                // Found an error message, return it
+                match CString::new(error) {
+                    Ok(c_str) => c_str.into_raw(),
+                    Err(_) => std::ptr::null_mut(),
+                }
+            } else {
+                // No error field found
+                std::ptr::null_mut()
+            }
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// Parse tools JSON and extract structured data for virtual table
 /// Returns number of tools found, or 0 on error
 #[no_mangle]

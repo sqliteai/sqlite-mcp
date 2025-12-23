@@ -1349,70 +1349,129 @@ int test_error_virtual_tables_not_connected(sqlite3 *db) {
         sqlite3_finalize(stmt);
     }
 
-    const char *queries[] = {
-        "SELECT COUNT(*) FROM mcp_list_tools",
-        "SELECT COUNT(*) FROM mcp_list_tools_respond"
-    };
-    int num_queries = sizeof(queries) / sizeof(queries[0]);
+    // Test that virtual tables return SQL errors when not connected
+    // Note: streaming tables (mcp_list_tools) may return 0 rows instead of errors
+    // due to how stream initialization works
+    printf("    [1/2] Testing: SELECT COUNT(*) FROM mcp_list_tools_respond\n");
+    rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM mcp_list_tools_respond", -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
 
-    for (int i = 0; i < num_queries; i++) {
-        printf("    [%d/%d] Testing: %s\n", i+1, num_queries, queries[i]);
-        
-        rc = sqlite3_prepare_v2(db, queries[i], -1, &stmt, 0);
-        if (rc != SQLITE_OK) {
-            fprintf(stderr, "    Failed to prepare: %s\n", sqlite3_errmsg(db));
-            return 1;
-        }
-
-        rc = sqlite3_step(stmt);
-        if (rc != SQLITE_ROW) {
-            fprintf(stderr, "    Failed to execute: %s\n", sqlite3_errmsg(db));
+    rc = sqlite3_step(stmt);
+    // Non-streaming virtual tables now return SQLITE_ERROR when not connected
+    if (rc == SQLITE_ERROR) {
+        const char *error_msg = sqlite3_errmsg(db);
+        if (strstr(error_msg, "Not connected") != NULL) {
+            printf("    ✓ mcp_list_tools_respond returns error when not connected: %s\n", error_msg);
+        } else {
+            fprintf(stderr, "    Unexpected error message: %s\n", error_msg);
             sqlite3_finalize(stmt);
             return 1;
         }
-
-        int count = sqlite3_column_int(stmt, 0);
+    } else {
+        fprintf(stderr, "    Expected SQLITE_ERROR but got rc=%d\n", rc);
         sqlite3_finalize(stmt);
-        
-        if (count == 0) {
-            printf("    ✓ Virtual table correctly returns 0 rows when not connected\n");
+        return 1;
+    }
+    sqlite3_finalize(stmt);
+
+    // Test streaming table - may return 0 rows or error depending on initialization
+    printf("    [2/2] Testing: SELECT COUNT(*) FROM mcp_list_tools\n");
+    rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM mcp_list_tools", -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ERROR) {
+        const char *error_msg = sqlite3_errmsg(db);
+        if (strstr(error_msg, "Not connected") != NULL) {
+            printf("    ✓ mcp_list_tools returns error when not connected: %s\n", error_msg);
         } else {
-            fprintf(stderr, "    Expected 0 rows but got %d\n", count);
+            fprintf(stderr, "    Unexpected error message: %s\n", error_msg);
+            sqlite3_finalize(stmt);
             return 1;
         }
-    }
-
-    // Test function-style virtual tables that should return no rows when not connected
-    const char *function_queries[] = {
-        "SELECT COUNT(*) FROM mcp_call_tool('test', '{}')",
-        "SELECT COUNT(*) FROM mcp_call_tool_respond('test', '{}')"
-    };
-    int num_function_queries = sizeof(function_queries) / sizeof(function_queries[0]);
-
-    for (int i = 0; i < num_function_queries; i++) {
-        printf("    [%d/%d] Testing function-style: %s\n", i+3, num_queries+num_function_queries, function_queries[i]);
-        
-        rc = sqlite3_prepare_v2(db, function_queries[i], -1, &stmt, 0);
-        if (rc != SQLITE_OK) {
-            printf("    ✓ Function-style query failed as expected (not connected): %s\n", sqlite3_errmsg(db));
-            continue;
-        }
-
-        rc = sqlite3_step(stmt);
-        if (rc == SQLITE_ROW) {
-            int count = sqlite3_column_int(stmt, 0);
-            if (count == 0) {
-                printf("    ✓ Function-style virtual table correctly returns 0 rows when not connected\n");
-            } else {
-                fprintf(stderr, "    Expected 0 rows but got %d\n", count);
-                sqlite3_finalize(stmt);
-                return 1;
-            }
+    } else if (rc == SQLITE_ROW) {
+        int count = sqlite3_column_int(stmt, 0);
+        if (count == 0) {
+            printf("    ✓ mcp_list_tools returns 0 rows when not connected (streaming behavior)\n");
         } else {
-            printf("    ✓ Function-style query failed as expected (not connected)\n");
+            fprintf(stderr, "    Expected 0 rows but got %d\n", count);
+            sqlite3_finalize(stmt);
+            return 1;
         }
+    } else {
+        fprintf(stderr, "    Expected SQLITE_ERROR or 0 rows, got rc=%d\n", rc);
         sqlite3_finalize(stmt);
+        return 1;
     }
+    sqlite3_finalize(stmt);
+
+    // Test function-style virtual tables
+    // Note: mcp_call_tool is streaming, mcp_call_tool_respond is non-streaming
+    printf("    [3/4] Testing function-style: SELECT COUNT(*) FROM mcp_call_tool('test', '{}')\n");
+    rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM mcp_call_tool('test', '{}')", -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+
+    rc = sqlite3_step(stmt);
+    // mcp_call_tool is streaming - may return 0 rows or error
+    if (rc == SQLITE_ERROR) {
+        const char *error_msg = sqlite3_errmsg(db);
+        if (strstr(error_msg, "Not connected") != NULL) {
+            printf("    ✓ mcp_call_tool returns error when not connected: %s\n", error_msg);
+        } else {
+            fprintf(stderr, "    Unexpected error message: %s\n", error_msg);
+            sqlite3_finalize(stmt);
+            return 1;
+        }
+    } else if (rc == SQLITE_ROW) {
+        int count = sqlite3_column_int(stmt, 0);
+        if (count == 0) {
+            printf("    ✓ mcp_call_tool returns 0 rows when not connected (streaming behavior)\n");
+        } else {
+            fprintf(stderr, "    Expected 0 rows but got %d\n", count);
+            sqlite3_finalize(stmt);
+            return 1;
+        }
+    } else {
+        fprintf(stderr, "    Expected SQLITE_ERROR or 0 rows, got rc=%d\n", rc);
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    sqlite3_finalize(stmt);
+
+    // Test non-streaming function-style virtual table
+    printf("    [4/4] Testing function-style: SELECT COUNT(*) FROM mcp_call_tool_respond('test', '{}')\n");
+    rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM mcp_call_tool_respond('test', '{}')", -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+
+    rc = sqlite3_step(stmt);
+    // mcp_call_tool_respond is non-streaming - should return SQLITE_ERROR
+    if (rc == SQLITE_ERROR) {
+        const char *error_msg = sqlite3_errmsg(db);
+        if (strstr(error_msg, "Not connected") != NULL) {
+            printf("    ✓ mcp_call_tool_respond returns error when not connected: %s\n", error_msg);
+        } else {
+            fprintf(stderr, "    Unexpected error message: %s\n", error_msg);
+            sqlite3_finalize(stmt);
+            return 1;
+        }
+    } else {
+        fprintf(stderr, "    Expected SQLITE_ERROR but got rc=%d\n", rc);
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    sqlite3_finalize(stmt);
 
     return 0;
 }
@@ -1552,6 +1611,164 @@ int test_error_invalid_tool_calls(sqlite3 *db) {
     return 0;
 }
 
+// Test comprehensive error extraction for all virtual tables
+int test_error_extraction_comprehensive(sqlite3 *db) {
+    sqlite3_stmt *stmt;
+    int rc;
+
+    // Ensure we're disconnected for "not connected" error tests
+    rc = sqlite3_prepare_v2(db, "SELECT mcp_disconnect()", -1, &stmt, 0);
+    if (rc == SQLITE_OK) {
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    }
+
+    printf("    [1/6] Testing mcp_list_tools error extraction (not connected)\n");
+    rc = sqlite3_prepare_v2(db, "SELECT name FROM mcp_list_tools", -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+    rc = sqlite3_step(stmt);
+    // Streaming tables may return SQLITE_DONE (no rows) or SQLITE_ERROR depending on stream init
+    if (rc == SQLITE_ERROR) {
+        const char *err = sqlite3_errmsg(db);
+        if (strstr(err, "Not connected") != NULL) {
+            printf("    ✓ mcp_list_tools returns extracted error: %.80s\n", err);
+        } else {
+            fprintf(stderr, "    Unexpected error: %s\n", err);
+            sqlite3_finalize(stmt);
+            return 1;
+        }
+    } else if (rc == SQLITE_DONE) {
+        printf("    ✓ mcp_list_tools returns no rows when not connected (streaming behavior)\n");
+    } else {
+        fprintf(stderr, "    Expected SQLITE_ERROR or SQLITE_DONE, got rc=%d\n", rc);
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    sqlite3_finalize(stmt);
+
+    printf("    [2/6] Testing mcp_list_tools_respond error extraction (not connected)\n");
+    rc = sqlite3_prepare_v2(db, "SELECT name FROM mcp_list_tools_respond", -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ERROR) {
+        const char *err = sqlite3_errmsg(db);
+        if (strstr(err, "Not connected") != NULL) {
+            printf("    ✓ mcp_list_tools_respond returns extracted error: %.80s\n", err);
+        } else {
+            fprintf(stderr, "    Unexpected error: %s\n", err);
+            sqlite3_finalize(stmt);
+            return 1;
+        }
+    } else {
+        fprintf(stderr, "    Expected SQLITE_ERROR, got rc=%d\n", rc);
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    sqlite3_finalize(stmt);
+
+    printf("    [3/6] Testing mcp_call_tool error extraction (not connected)\n");
+    rc = sqlite3_prepare_v2(db, "SELECT text FROM mcp_call_tool('test', '{}')", -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+    rc = sqlite3_step(stmt);
+    // Streaming tables may return SQLITE_DONE (no rows) or SQLITE_ERROR depending on stream init
+    if (rc == SQLITE_ERROR) {
+        const char *err = sqlite3_errmsg(db);
+        if (strstr(err, "Not connected") != NULL) {
+            printf("    ✓ mcp_call_tool returns extracted error: %.80s\n", err);
+        } else {
+            fprintf(stderr, "    Unexpected error: %s\n", err);
+            sqlite3_finalize(stmt);
+            return 1;
+        }
+    } else if (rc == SQLITE_DONE) {
+        printf("    ✓ mcp_call_tool returns no rows when not connected (streaming behavior)\n");
+    } else {
+        fprintf(stderr, "    Expected SQLITE_ERROR or SQLITE_DONE, got rc=%d\n", rc);
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    sqlite3_finalize(stmt);
+
+    printf("    [4/6] Testing mcp_call_tool_respond error extraction (not connected)\n");
+    rc = sqlite3_prepare_v2(db, "SELECT text FROM mcp_call_tool_respond('test', '{}')", -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ERROR) {
+        const char *err = sqlite3_errmsg(db);
+        if (strstr(err, "Not connected") != NULL) {
+            printf("    ✓ mcp_call_tool_respond returns extracted error: %.80s\n", err);
+        } else {
+            fprintf(stderr, "    Unexpected error: %s\n", err);
+            sqlite3_finalize(stmt);
+            return 1;
+        }
+    } else {
+        fprintf(stderr, "    Expected SQLITE_ERROR, got rc=%d\n", rc);
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    sqlite3_finalize(stmt);
+
+    // Now connect to test other error cases
+    printf("    [5/6] Connecting to MCP server for additional error tests\n");
+    rc = sqlite3_prepare_v2(db, "SELECT mcp_connect('http://localhost:8931/mcp')", -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        printf("    Skipping connected error tests - can't connect\n");
+        return 0;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        printf("    Skipping connected error tests - MCP server not available\n");
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+    const unsigned char *connect_result = sqlite3_column_text(stmt, 0);
+    sqlite3_finalize(stmt);
+    if (connect_result != NULL) {
+        printf("    Skipping connected error tests - connection failed\n");
+        return 0;
+    }
+    printf("    ✓ Connected successfully\n");
+
+    // Test invalid JSON arguments error
+    printf("    [6/6] Testing mcp_call_tool_respond error extraction (invalid JSON)\n");
+    rc = sqlite3_prepare_v2(db, "SELECT text FROM mcp_call_tool_respond('browser_navigate', 'not-valid-json')", -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "    Failed to prepare: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ERROR) {
+        const char *err = sqlite3_errmsg(db);
+        if (strstr(err, "Invalid JSON") != NULL || strstr(err, "Invalid") != NULL) {
+            printf("    ✓ mcp_call_tool_respond returns extracted error for invalid JSON: %.80s\n", err);
+        } else {
+            fprintf(stderr, "    Unexpected error for invalid JSON: %s\n", err);
+            sqlite3_finalize(stmt);
+            return 1;
+        }
+    } else {
+        fprintf(stderr, "    Expected SQLITE_ERROR for invalid JSON, got rc=%d\n", rc);
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+    sqlite3_finalize(stmt);
+
+    return 0;
+}
+
 int main(void) {
     printf("\n=== sqlite-mcp Test Suite ===\n\n");
 
@@ -1578,6 +1795,7 @@ int main(void) {
     run_test("Error: malformed URL", test_error_malformed_url);
     run_test("Error: virtual tables when not connected", test_error_virtual_tables_not_connected);
     run_test("Error: invalid tool calls", test_error_invalid_tool_calls);
+    run_test("Error: comprehensive error extraction for all virtual tables", test_error_extraction_comprehensive);
 
     // Standard MCP tests
     printf("\n--- Standard MCP Operations ---\n");

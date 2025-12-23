@@ -137,6 +137,7 @@ extern void mcp_stream_free_result(StreamResult* result);
 extern char* mcp_list_tools_json(void*);
 extern char* mcp_call_tool_json(void*, const char*, const char*);
 extern void mcp_free_string(char*);
+extern char* mcp_extract_error_message(const char*);
 
 // JSON parsing functions (using serde_json in Rust)
 extern size_t mcp_parse_tools_json(const char* json_str);
@@ -275,10 +276,21 @@ static int mcp_stream_next_impl(sqlite3_vtab_cursor *cur) {
       break;
 
     case STREAM_TYPE_ERROR:
-      // Stream error - stop iteration
+      // Stream error - stop iteration and set error message
       DF("mcp_stream_next_impl: STREAM_TYPE_ERROR - %s", result->data ? result->data : "unknown error");
+      if (result->data) {
+        char *error_msg = mcp_extract_error_message(result->data);
+        if (error_msg) {
+          ((mcp_stream_vtab*)pCur->base.pVtab)->base.zErrMsg = sqlite3_mprintf("%s", error_msg);
+          mcp_free_string(error_msg);
+        } else {
+          // If not JSON error format, use the data directly
+          ((mcp_stream_vtab*)pCur->base.pVtab)->base.zErrMsg = sqlite3_mprintf("%s", result->data);
+        }
+      }
       pCur->eof = 1;
-      break;
+      mcp_stream_free_result(result);
+      return SQLITE_ERROR;
 
     case STREAM_TYPE_DONE:
       // Stream complete
@@ -543,6 +555,24 @@ static int mcp_call_tool_stream_next(sqlite3_vtab_cursor *cur){
     return SQLITE_OK;
   }
 
+  if (result->result_type == STREAM_TYPE_ERROR) {
+    // Stream error - stop iteration and set error message
+    DF("mcp_call_tool_stream_next: STREAM_TYPE_ERROR - %s", result->data ? result->data : "unknown error");
+    if (result->data) {
+      char *error_msg = mcp_extract_error_message(result->data);
+      if (error_msg) {
+        ((mcp_call_tool_stream_vtab*)pCur->base.pVtab)->base.zErrMsg = sqlite3_mprintf("%s", error_msg);
+        mcp_free_string(error_msg);
+      } else {
+        // If not JSON error format, use the data directly
+        ((mcp_call_tool_stream_vtab*)pCur->base.pVtab)->base.zErrMsg = sqlite3_mprintf("%s", result->data);
+      }
+    }
+    pCur->eof = 1;
+    mcp_stream_free_result(result);
+    return SQLITE_ERROR;
+  }
+
   if (result->result_type == STREAM_TYPE_DONE) {
     pCur->eof = 1;
     mcp_stream_free_result(result);
@@ -763,12 +793,15 @@ static int mcp_tools_filter(
     }
 
     DF("mcp_tools_filter: Got JSON result (%d bytes)", (int)strlen(result));
-    // Check for errors - only check if it starts with error
-    if (strncmp(result, "{\"error\"", 8) == 0) {
+    // Check for errors and extract error message
+    char *error_msg = mcp_extract_error_message(result);
+    if (error_msg) {
       D("mcp_tools_filter: JSON contains error");
+      pVtab->base.zErrMsg = sqlite3_mprintf("%s", error_msg);
+      mcp_free_string(error_msg);
       mcp_free_string(result);
       pCur->eof = 1;
-      return SQLITE_OK;
+      return SQLITE_ERROR;
     }
 
     // Create temporary table
@@ -1073,6 +1106,17 @@ static int mcp_results_filter(
   // Parse JSON in the Rust layer
   DF("  Tool result (%d bytes): %.200s%s", (int)strlen(pCur->json_result),
      pCur->json_result, strlen(pCur->json_result) > 200 ? "..." : "");
+
+  // Check for errors first
+  char *error_msg = mcp_extract_error_message(pCur->json_result);
+  if (error_msg) {
+    D("  JSON contains error");
+    pVtab->base.zErrMsg = sqlite3_mprintf("%s", error_msg);
+    mcp_free_string(error_msg);
+    pCur->eof = 1;
+    return SQLITE_ERROR;
+  }
+
   pCur->content_count = mcp_parse_call_result_json(pCur->json_result);
   DF("  Parsed content count: %d", (int)pCur->content_count);
 
