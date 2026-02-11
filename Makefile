@@ -100,7 +100,7 @@ else ifeq ($(PLATFORM),android)
 	CC = $(BIN)/$(ARCH)-linux-$(ANDROID_ABI)-clang
 	OPENSSL = $(OPENSSL_INSTALL_DIR)/lib/libssl.a
 	TARGET := $(DIST_DIR)/mcp.so
-	LDFLAGS += -shared -L$(OPENSSL_INSTALL_DIR)/lib -Wl,--gc-sections
+	LDFLAGS += -shared -L$(OPENSSL_INSTALL_DIR)/lib -Wl,--gc-sections -Wl,-z,max-page-size=16384
 	CFLAGS += -fPIC -I$(OPENSSL_INSTALL_DIR)/include
 	STRIP = $(BIN)/llvm-strip --strip-unneeded $@
 	LIBS = -lmcp_ffi -ldl -lm -lssl -lcrypto

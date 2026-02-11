@@ -10,6 +10,27 @@ A SQLite extension that integrates the [Model Context Protocol (MCP)](https://mo
 
 Download for your platform: **macOS**, **Linux**, **Windows**, **Android**, and **iOS**.
 
+#### Flutter Package
+
+Add the [sqlite_mcp](https://pub.dev/packages/sqlite_mcp) package to your project:
+
+```bash
+flutter pub add sqlite_mcp  # Flutter projects
+dart pub add sqlite_mcp     # Dart projects
+```
+
+Usage with `sqlite3` package:
+```dart
+import 'package:sqlite3/sqlite3.dart';
+import 'package:sqlite_mcp/sqlite_mcp.dart';
+
+sqlite3.loadSqliteMcpExtension();
+final db = sqlite3.openInMemory();
+print(db.select('SELECT mcp_version()'));
+```
+
+For a complete example, see the [Flutter example](https://github.com/sqliteai/sqlite-extensions-guide/blob/main/examples/flutter/README.md).
+
 ### Basic Usage
 
 ```sql

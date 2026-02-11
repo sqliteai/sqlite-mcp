@@ -40,12 +40,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/sqliteai/sqlite-mcp.git",
+    "url": "git+https://github.com/sqliteai/sqlite-mcp.git",
     "directory": "packages/node"
   },
   "homepage": "https://github.com/sqliteai/sqlite-mcp#readme",
   "bugs": {
-    "url": "https://github.com/sqliteai/sqlite-mcp/issues"
+    "url": "git+https://github.com/sqliteai/sqlite-mcp/issues"
   },
   "engines": {
     "node": ">=16.0.0"

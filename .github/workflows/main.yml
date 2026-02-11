@@ -8,6 +8,10 @@
 name: Build, Test and Release
 on:
   push:
+    branches:
+      - '**'
+    tags-ignore:
+      - '**'
   workflow_dispatch:
 
 permissions:
@@ -353,11 +357,8 @@ jobs:
       - uses: actions/setup-node@v4
         if: steps.tag.outputs.version != ''
         with:
-          node-version: '20'
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
-
-      - name: update npm
-        run: npm install -g npm@11.5.1
 
       - name: build and publish npm packages
         if: steps.tag.outputs.version != ''
@@ -414,10 +415,12 @@ jobs:
       - uses: softprops/action-gh-release@v2.2.1
         if: steps.tag.outputs.version != ''
         with:
+          token: ${{ secrets.RELEASE_PAT }}
           body: |
-          
+
             ## Packages
 
+            [**Flutter/Dart**](https://pub.dev/packages/sqlite_mcp): `flutter pub add sqlite_mcp:${{ steps.tag.outputs.version }}` or `dart pub add sqlite_mcp:${{ steps.tag.outputs.version }}`
             [**Node**](https://www.npmjs.com/package/@sqliteai/sqlite-mcp): `npm install @sqliteai/sqlite-mcp`
             [**Android**](https://central.sonatype.com/artifact/ai.sqlite/mcp): `ai.sqlite:mcp:${{ steps.tag.outputs.version }}`
             [**Swift**](https://github.com/sqliteai/sqlite-mcp#swift-package): [Installation Guide](https://github.com/sqliteai/sqlite-mcp#swift-package)

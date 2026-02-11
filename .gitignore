@@ -53,3 +53,10 @@ packages/node/test-platform-packages/
 .DS_Store
 Thumbs.db
 *.db
+
+# Dart/Flutter
+.dart_tool/
+pubspec.lock
+.flutter-plugins
+.flutter-plugins-dependencies
+packages/flutter/native_libraries/

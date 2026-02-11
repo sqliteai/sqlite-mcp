@@ -1,0 +1,20 @@
+name: sqlite_mcp
+version: 0.1.5
+description: >
+  A SQLite extension that integrates the Model Context Protocol (MCP) Rust SDK,
+  enabling SQLite databases to connect to MCP servers and call their tools.
+homepage: https://github.com/sqliteai/sqlite-mcp
+repository: https://github.com/sqliteai/sqlite-mcp
+
+environment:
+  sdk: ^3.10.0
+
+dependencies:
+  code_assets: ^1.0.0
+  hooks: ^1.0.0
+  path: ^1.8.0
+  sqlite3: ^3.0.0
+
+dev_dependencies:
+  lints: ^5.0.0
+  test: ^1.24.0
