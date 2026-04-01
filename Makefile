@@ -302,7 +302,7 @@ endef
 LIB_NAMES = ios.dylib ios-sim.dylib macos.dylib
 FMWK_NAMES = ios-arm64 ios-arm64_x86_64-simulator macos-arm64_x86_64
 $(DIST_DIR)/%.xcframework: $(LIB_NAMES)
-	@$(foreach i,1 2 3,\
+	@$(foreach i,1 2,\
 		lib=$(word $(i),$(LIB_NAMES)); \
 		fmwk=$(word $(i),$(FMWK_NAMES)); \
 		mkdir -p $(DIST_DIR)/$$fmwk/mcp.framework/Headers; \
@@ -313,6 +313,21 @@ $(DIST_DIR)/%.xcframework: $(LIB_NAMES)
 		mv $(DIST_DIR)/$$lib $(DIST_DIR)/$$fmwk/mcp.framework/mcp; \
 		install_name_tool -id "@rpath/mcp.framework/mcp" $(DIST_DIR)/$$fmwk/mcp.framework/mcp; \
 	)
+	@lib=$(word 3,$(LIB_NAMES)); \
+	fmwk=$(word 3,$(FMWK_NAMES)); \
+	mkdir -p $(DIST_DIR)/$$fmwk/mcp.framework/Versions/A/Headers; \
+	mkdir -p $(DIST_DIR)/$$fmwk/mcp.framework/Versions/A/Modules; \
+	mkdir -p $(DIST_DIR)/$$fmwk/mcp.framework/Versions/A/Resources; \
+	cp $(SRC_DIR)/sqlite-mcp.h $(DIST_DIR)/$$fmwk/mcp.framework/Versions/A/Headers; \
+	printf "$(PLIST)" > $(DIST_DIR)/$$fmwk/mcp.framework/Versions/A/Resources/Info.plist; \
+	printf "$(MODULEMAP)" > $(DIST_DIR)/$$fmwk/mcp.framework/Versions/A/Modules/module.modulemap; \
+	mv $(DIST_DIR)/$$lib $(DIST_DIR)/$$fmwk/mcp.framework/Versions/A/mcp; \
+	install_name_tool -id "@rpath/mcp.framework/mcp" $(DIST_DIR)/$$fmwk/mcp.framework/Versions/A/mcp; \
+	ln -sf A $(DIST_DIR)/$$fmwk/mcp.framework/Versions/Current; \
+	ln -sf Versions/Current/mcp $(DIST_DIR)/$$fmwk/mcp.framework/mcp; \
+	ln -sf Versions/Current/Headers $(DIST_DIR)/$$fmwk/mcp.framework/Headers; \
+	ln -sf Versions/Current/Modules $(DIST_DIR)/$$fmwk/mcp.framework/Modules; \
+	ln -sf Versions/Current/Resources $(DIST_DIR)/$$fmwk/mcp.framework/Resources;
 	xcodebuild -create-xcframework $(foreach fmwk,$(FMWK_NAMES),-framework $(DIST_DIR)/$(fmwk)/mcp.framework) -output $@
 	rm -rf $(foreach fmwk,$(FMWK_NAMES),$(DIST_DIR)/$(fmwk))
 
