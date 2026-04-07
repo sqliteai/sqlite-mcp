@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define SQLITE_MCP_VERSION "0.1.8"
+#define SQLITE_MCP_VERSION "0.1.9"
 
 /**
  * SQLite extension entry point
