@@ -1,3 +1,41 @@
+<div align="center">
+  <a href="https://sqlite.ai">
+    <img src="https://www.sqlite.ai/social/logo-ai.png" alt="SQLite AI" height="56">
+  </a>
+
+  <h1>SQLite-MCP</h1>
+  <p><strong>Call MCP tools directly from SQL.</strong><br>
+  Integrates the Model Context Protocol into SQLite — connect to any MCP server and invoke its tools from inside a query. Bridge between your database and the agent ecosystem.</p>
+
+  <p>
+    <a href="https://dashboard.sqlitecloud.io/auth/sign-in"><strong>Free managed instance →</strong></a> ·
+    <a href="https://docs.sqlitecloud.io/docs/ai-overview">Docs</a> ·
+    <a href="https://sqlite.ai">Website</a> ·
+    <a href="https://blog.sqlite.ai">Blog</a>
+  </p>
+
+  <p>
+    <sub><strong>Data:</strong>
+    <a href="https://github.com/sqliteai/sqlite-vector">Vector</a> ·
+    <a href="https://github.com/sqliteai/sqlite-sync">Sync</a> ·
+    <a href="https://github.com/sqliteai/sqlite-columnar">Columnar</a> ·
+    <a href="https://github.com/sqliteai/sqlite-js">JS</a>
+    <br>
+    <strong>AI:</strong>
+    <a href="https://github.com/sqliteai/sqlite-ai">AI</a> ·
+    <a href="https://github.com/sqliteai/sqlite-agent">Agent</a> ·
+    <a href="https://github.com/sqliteai/sqlite-memory">Memory</a> ·
+    <a href="https://github.com/sqliteai/sqlite-mcp">MCP</a>
+    </sub>
+  </p>
+</div>
+
+<br>
+
+> **Want managed MCP infrastructure?** SQLite-MCP connects to any MCP server locally; **[SQLite Cloud](https://dashboard.sqlitecloud.io/auth/sign-in)** includes a built-in MCP server, edge functions, and auth — so you can expose your data as an MCP target. Free tier available.
+
+---
+
 # SQLite MCP
 
 A SQLite extension that integrates the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) Rust SDK, enabling SQLite databases to connect to MCP servers and call their tools.
@@ -161,19 +199,32 @@ MIT License - See [LICENSE](LICENSE) for details
 
 ---
 
-## Part of the SQLite AI Ecosystem
+## ☁️ Hosted version
 
-This project is part of the **SQLite AI** ecosystem, a collection of extensions that bring modern AI capabilities to the world’s most widely deployed database. The goal is to make SQLite the default data and inference engine for Edge AI applications.
+Want to expose your database as an MCP target? **[SQLite Cloud](https://sqlite.ai)** includes a built-in MCP server, REST APIs, auth, and edge functions — so any MCP-compatible agent (Claude, Cursor, custom clients) can read and write your data securely.
 
-Other projects in the ecosystem include:
+[**Start free →**](https://dashboard.sqlitecloud.io/auth/sign-in)
 
-- **[SQLite-AI](https://github.com/sqliteai/sqlite-ai)** — On-device inference and embedding generation directly inside SQLite.
-- **[SQLite-Memory](https://github.com/sqliteai/sqlite-memory)** — Markdown-based AI agent memory with semantic search.
-- **[SQLite-Vector](https://github.com/sqliteai/sqlite-vector)** — Ultra-efficient vector search for embeddings stored as BLOBs in standard SQLite tables.
-- **[SQLite-Sync](https://github.com/sqliteai/sqlite-sync)** — Local-first CRDT-based synchronization for seamless, conflict-free data sync and real-time collaboration across devices.
-- **[SQLite-Agent](https://github.com/sqliteai/sqlite-agent)** — Run autonomous AI agents directly from within SQLite databases.
-- **[SQLite-MCP](https://github.com/sqliteai/sqlite-mcp)** — Connect SQLite databases to MCP servers and invoke their tools.
-- **[SQLite-JS](https://github.com/sqliteai/sqlite-js)** — Create custom SQLite functions using JavaScript.
-- **[Liteparser](https://github.com/sqliteai/liteparser)** — A highly efficient and fully compliant SQLite SQL parser.
+---
 
-Learn more at **[SQLite AI](https://sqlite.ai)**.
+## Part of the SQLite AI stack
+
+SQLite-MCP is one piece of a larger ecosystem that turns SQLite into a runtime for intelligent, distributed data:
+
+**Data layer**
+- [sqlite-vector](https://github.com/sqliteai/sqlite-vector) — ANN vector search inside SQLite
+- [sqlite-sync](https://github.com/sqliteai/sqlite-sync) — Offline-first CRDT sync across devices
+- [sqlite-columnar](https://github.com/sqliteai/sqlite-columnar) — Column-oriented analytics for OLAP queries
+- [sqlite-js](https://github.com/sqliteai/sqlite-js) — Custom SQLite functions written in JavaScript
+
+**AI layer**
+- [sqlite-ai](https://github.com/sqliteai/sqlite-ai) — On-device LLM inference and embeddings
+- [sqlite-agent](https://github.com/sqliteai/sqlite-agent) — Autonomous AI agents running inside SQLite
+- [sqlite-memory](https://github.com/sqliteai/sqlite-memory) — Persistent, searchable memory for agents
+- [**sqlite-mcp**](https://github.com/sqliteai/sqlite-mcp) — Call MCP tools directly from SQL queries *(you are here)*
+
+**Managed platform**
+- [SQLite Cloud](https://sqlite.ai) — Hosted SQLite with sync, auth, edge functions, and analytics. [Free tier →](https://dashboard.sqlitecloud.io/auth/sign-in)
+
+Built by [SQLite AI](https://sqlite.ai). Questions? [Open a discussion](https://github.com/sqliteai/sqlite-mcp/discussions) or [contact us](https://sqlite.ai/support).
+
