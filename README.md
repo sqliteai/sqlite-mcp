@@ -193,12 +193,6 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ---
 
-## 📄 License
-
-MIT License - See [LICENSE](LICENSE) for details
-
----
-
 ## ☁️ Hosted version
 
 Want to expose your database as an MCP target? **[SQLite Cloud](https://sqlite.ai)** includes a built-in MCP server, REST APIs, auth, and edge functions — so any MCP-compatible agent (Claude, Cursor, custom clients) can read and write your data securely.
