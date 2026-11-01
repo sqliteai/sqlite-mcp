@@ -5,7 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-11-01
+
+Re-release of 0.2.0, which never completed. Its npm step failed on a Sigstore
+transparency-log conflict (`TLOG_CREATE_ENTRY_ERROR`, 409) after the Android
+artifact had already been accepted by Maven Central, so `ai.sqlite:mcp:0.2.0`
+exists there while npm, the git tag, the GitHub release and pub.dev were left at
+0.1.9. The code is identical to 0.2.0; see its entry below for what changed.
+
 ## [0.2.0] - 2026-11-01
+
+Superseded by 0.2.1: published to Maven Central only, never released elsewhere.
+
 
 This release changes behaviour that callers may depend on. See **Changed** below
 before upgrading.
@@ -78,4 +89,5 @@ before upgrading.
 - Documented session scope, the schema restrictions above, and `isError`
   handling in `API.md`.
 
+[0.2.1]: https://github.com/sqliteai/sqlite-mcp/releases/tag/0.2.1
 [0.2.0]: https://github.com/sqliteai/sqlite-mcp/releases/tag/0.2.0
