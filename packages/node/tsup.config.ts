@@ -10,5 +10,7 @@ export default defineConfig({
   treeshake: true,
   minify: false,
   target: 'node16',
+  // Defines `require` in the ESM bundle and `import.meta.url` in the CJS one
+  shims: true,
   outDir: 'dist',
 });

@@ -146,7 +146,7 @@ SELECT mcp_connect('http://localhost:8000/mcp');
 ### SSE (Legacy)
 Server-Sent Events for compatibility with older servers.
 ```sql
-SELECT mcp_connect('http://localhost:8931/sse', 1);
+SELECT mcp_connect('http://localhost:8931/sse', NULL, 1);
 ```
 
 ## 🚦 Quick Usage Example

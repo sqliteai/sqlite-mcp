@@ -1,5 +1,6 @@
 import { resolve } from 'node:path';
 import { existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import {
   getCurrentPlatform,
   getPlatformPackageName,
@@ -18,6 +19,18 @@ export class ExtensionNotFoundError extends Error {
 }
 
 /**
+ * Loads a CommonJS module from either bundle format
+ *
+ * A bare `require` call cannot be used: it does not exist in the ESM bundle,
+ * where it throws instead of resolving the module. `createRequire` works in
+ * both, because `import.meta.url` is native in the ESM bundle and is shimmed by
+ * tsup in the CommonJS one (see `shims` in tsup.config.ts).
+ */
+function requireModule(id: string): { path?: unknown } | undefined {
+  return createRequire(import.meta.url)(id);
+}
+
+/**
  * Attempts to load the platform-specific package
  * @returns The path to the extension binary, or null if not found
  */
@@ -25,9 +38,7 @@ function tryLoadPlatformPackage(): string | null {
   try {
     const packageName = getPlatformPackageName();
 
-    // Try to dynamically import the platform package
-    // This works in both CommonJS and ESM
-    const platformPackage = require(packageName);
+    const platformPackage = requireModule(packageName);
 
     if (platformPackage?.path && typeof platformPackage.path === 'string') {
       if (existsSync(platformPackage.path)) {

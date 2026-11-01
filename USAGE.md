@@ -25,8 +25,8 @@ Connect to an MCP server with optional custom headers.
 -- Simple syntax with Authorization header
 SELECT mcp_connect(
     'https://api.githubcopilot.com/mcp/',
-    0,  -- Use streamable HTTP
-    '{"Authorization": "Bearer ghp_your_github_personal_access_token"}'
+    '{"Authorization": "Bearer ghp_your_github_personal_access_token"}',
+    0  -- Use streamable HTTP
 );
 ```
 
@@ -36,8 +36,8 @@ SELECT mcp_connect(
 -- Add multiple custom headers
 SELECT mcp_connect(
     'https://api.githubcopilot.com/mcp/',
-    0,
-    '{"Authorization": "Bearer ghp_token", "X-MCP-Readonly": "true", "X-Custom": "value"}'
+    '{"Authorization": "Bearer ghp_token", "X-MCP-Readonly": "true", "X-Custom": "value"}',
+    0
 );
 ```
 
@@ -57,6 +57,13 @@ SELECT mcp_connect('http://localhost:8000/mcp', NULL, 0);
 2. Store tokens in secure files with restricted permissions
 3. Use HTTPS in production to encrypt tokens
 4. Rotate API tokens regularly
+5. Remember that a session, and the credentials it carries, belongs to the
+   SQLite connection that opened it: another connection in the same process
+   cannot use it, and closing the connection releases it
+6. These functions cannot be used inside a VIEW, a TRIGGER or any other schema
+   structure, so a database file with a modified schema cannot make an
+   application contact a server on its behalf (see
+   [API.md](API.md#schema-restrictions))
 
 Example loading token from environment variable in your application code:
 
@@ -84,7 +91,7 @@ Headers must be provided as a valid JSON object string with header names as keys
 When passing to SQL, escape quotes properly:
 
 ```sql
-SELECT mcp_connect('http://localhost:8000/mcp', 0, '{"Authorization": "Bearer token"}');
+SELECT mcp_connect('http://localhost:8000/mcp', '{"Authorization": "Bearer token"}', 0);
 ```
 
 ### Query Tools as Rows

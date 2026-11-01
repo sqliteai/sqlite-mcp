@@ -6,8 +6,9 @@
 //
 
 use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_void};
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use rmcp::transport::{SseClientTransport, StreamableHttpClientTransport};
@@ -15,8 +16,47 @@ use rmcp::{ServiceExt, RoleClient};
 use rmcp::model::{ClientInfo, ClientCapabilities, Implementation};
 use serde_json;
 
-// Global client instance - one client per process
-static GLOBAL_CLIENT: OnceLock<Mutex<Option<McpClient>>> = OnceLock::new();
+// One client per SQLite connection, keyed by the connection handle. An MCP
+// session carries the credentials of whoever opened it, so it must not be
+// reachable from another connection that happens to share this process.
+static CLIENTS: OnceLock<Mutex<HashMap<usize, Arc<McpClient>>>> = OnceLock::new();
+
+// Stream ids are unique for the lifetime of the process, so a cursor that
+// outlives its session can never clean up another session's stream.
+static NEXT_STREAM_ID: AtomicUsize = AtomicUsize::new(1);
+
+fn clients() -> &'static Mutex<HashMap<usize, Arc<McpClient>>> {
+    CLIENTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The client bound to a SQLite connection, if that connection has one.
+/// The Arc is cloned out so that the registry lock is not held while the
+/// caller blocks on the client's runtime.
+fn client_for(db: *mut c_void) -> Option<Arc<McpClient>> {
+    if db.is_null() {
+        return None;
+    }
+    let guard = match clients().lock() {
+        Ok(g) => g,
+        Err(_) => return None,
+    };
+    guard.get(&(db as usize)).cloned()
+}
+
+/// Drop the client bound to a SQLite connection, which closes its MCP session
+/// and discards every stream still registered on it.
+fn forget_client(db: *mut c_void) {
+    if db.is_null() {
+        return;
+    }
+    let previous = match clients().lock() {
+        Ok(mut g) => g.remove(&(db as usize)),
+        Err(_) => None,
+    };
+    // Dropped once the registry lock is released: dropping a client shuts down
+    // its tokio runtime, which blocks until the runtime's tasks park.
+    drop(previous);
+}
 
 /// Extract error message from JSON error response
 /// Returns the error message string if found, or the original JSON if not found
@@ -81,6 +121,67 @@ pub extern "C" fn mcp_extract_error_message(json_str: *const c_char) -> *mut c_c
             }
         }
         Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Build a message out of the text content of a failed tool result
+fn tool_error_message(result: &serde_json::Value) -> String {
+    let texts: Vec<&str> = result
+        .get("content")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Worded apart from the "Tool call failed: ..." of a transport error, so
+    // that a tool which ran and refused stays distinguishable from a call that
+    // never got through
+    if texts.is_empty() {
+        "Tool reported an error (no details provided)".to_string()
+    } else {
+        format!("Tool reported an error: {}", texts.join("\n"))
+    }
+}
+
+/// Extract the error message of a tool call that failed at the application
+/// level, that is one whose result carries `isError: true`. Such a result is
+/// shaped like a successful one, so without this check its content would be
+/// handed to the caller as ordinary rows.
+/// Returns NULL when the call did not fail that way
+#[no_mangle]
+pub extern "C" fn mcp_extract_tool_error(json_str: *const c_char) -> *mut c_char {
+    if json_str.is_null() {
+        return ptr::null_mut();
+    }
+
+    let json_string = unsafe {
+        match CStr::from_ptr(json_str).to_str() {
+            Ok(s) => s,
+            Err(_) => return ptr::null_mut(),
+        }
+    };
+
+    let json: serde_json::Value = match serde_json::from_str(json_string) {
+        Ok(v) => v,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    // Accept both the bare result and the {"result": ...} wrapper that
+    // mcp_call_tool_json() produces
+    let result = json.get("result").unwrap_or(&json);
+
+    if result.get("isError").and_then(|v| v.as_bool()) != Some(true) {
+        return ptr::null_mut();
+    }
+
+    match CString::new(tool_error_message(result)) {
+        Ok(c_str) => c_str.into_raw(),
+        Err(_) => ptr::null_mut(),
     }
 }
 
@@ -273,49 +374,24 @@ pub struct McpClient {
     runtime: tokio::runtime::Runtime,
     service: Arc<TokioMutex<Option<RunningClient>>>,
     server_url: Mutex<Option<String>>,
-}
-
-/// Create a new MCP client
-/// Returns NULL on error
-#[no_mangle]
-pub extern "C" fn mcp_client_new() -> *mut McpClient {
-    match tokio::runtime::Runtime::new() {
-        Ok(runtime) => {
-            let client = Box::new(McpClient {
-                runtime,
-                service: Arc::new(TokioMutex::new(None)),
-                server_url: Mutex::new(None),
-            });
-            Box::into_raw(client)
-        }
-        Err(_) => ptr::null_mut(),
-    }
-}
-
-/// Free an MCP client
-#[no_mangle]
-pub extern "C" fn mcp_client_free(client: *mut McpClient) {
-    if client.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = Box::from_raw(client);
-    }
+    /// Streams opened by this connection's cursors, keyed by stream id
+    streams: TokioMutex<HashMap<usize, tokio::sync::mpsc::UnboundedReceiver<StreamChunk>>>,
 }
 
 /// Connect to an MCP server with optional custom headers
+/// db: the SQLite connection the session is bound to
 /// server_url: URL of the MCP server (e.g., "http://localhost:8931/sse")
 /// headers_json: Optional JSON string with custom headers (e.g., '{"Authorization": "Bearer token", "X-MCP-Readonly": "true"}'), can be NULL
 /// legacy_sse: 1 to use SSE transport (legacy), 0 to use streamable HTTP transport (default)
 /// Returns: NULL on success, error string on failure (must be freed with mcp_free_string)
 #[no_mangle]
 pub extern "C" fn mcp_connect(
-    _client_ptr: *mut McpClient,
+    db: *mut c_void,
     server_url: *const c_char,
     headers_json: *const c_char,
     legacy_sse: i32
 ) -> *mut c_char {
-    if server_url.is_null() {
+    if db.is_null() || server_url.is_null() {
         let error = r#"{"error": "Invalid arguments"}"#;
         return CString::new(error).unwrap_or_default().into_raw();
     }
@@ -367,6 +443,7 @@ pub extern "C" fn mcp_connect(
         },
         service: Arc::new(TokioMutex::new(None)),
         server_url: Mutex::new(None),
+        streams: TokioMutex::new(HashMap::new()),
     };
 
     let use_sse = legacy_sse != 0;
@@ -386,7 +463,9 @@ pub extern "C" fn mcp_connect(
                             headers.insert(header_name, header_value);
                         }
                         _ => {
-                            let error = format!(r#"{{"error": "Invalid header format: {}: {}"}}"#, key, value);
+                            // The value is left out of the message: it may be a
+                            // credential, and this string is returned to SQL
+                            let error = format!(r#"{{"error": "Invalid value for header {}"}}"#, key);
                             return (error, None);
                         }
                     }
@@ -460,55 +539,50 @@ pub extern "C" fn mcp_connect(
     } else {
         // Use streamable HTTP transport (default) with optional custom headers
         new_client.runtime.block_on(async {
-            // For Streamable HTTP, we need to extract the Authorization header specifically
-            // since it has a dedicated field, and we'll use a custom HTTP client for other headers
-            let auth_header_value = headers_map.as_ref().and_then(|m| m.get("Authorization")).map(|s| s.clone());
-
-            // Build streamable HTTP transport config
+            // Build streamable HTTP transport config.
+            //
+            // Authorization is sent as an ordinary header rather than through
+            // the transport's `auth_header` field: that field takes a bare
+            // token and prepends "Bearer " itself, so the documented
+            // {"Authorization": "Bearer <token>"} form would go out as
+            // "Bearer Bearer <token>", and any other scheme, such as Basic,
+            // would be corrupted the same way. Passing every header through
+            // untouched also matches what the SSE transport above does.
             let config = rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig {
                 uri: server_url_str.clone().into(),
-                auth_header: auth_header_value.map(|s| s.into()),
                 ..Default::default()
             };
 
-            // If there are other custom headers besides Authorization, create a custom HTTP client
+            // Create HTTP client with the caller's headers, if any
             let transport = if let Some(ref headers_map) = headers_map {
-                let non_auth_headers: std::collections::HashMap<String, String> = headers_map.iter()
-                    .filter(|(k, _)| k.as_str() != "Authorization")
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
+                use reqwest::header::{HeaderMap, HeaderValue, HeaderName};
+                let mut headers = HeaderMap::new();
 
-                if !non_auth_headers.is_empty() {
-                    // Create HTTP client with custom headers
-                    use reqwest::header::{HeaderMap, HeaderValue, HeaderName};
-                    let mut headers = HeaderMap::new();
-
-                    for (key, value) in non_auth_headers {
-                        match (HeaderName::from_bytes(key.as_bytes()), HeaderValue::from_str(&value)) {
-                            (Ok(header_name), Ok(header_value)) => {
-                                headers.insert(header_name, header_value);
-                            }
-                            _ => {
-                                let error = format!(r#"{{"error": "Invalid header format: {}: {}"}}"#, key, value);
-                                return (error, None);
-                            }
+                for (key, value) in headers_map {
+                    match (HeaderName::from_bytes(key.as_bytes()), HeaderValue::from_str(value)) {
+                        (Ok(header_name), Ok(header_value)) => {
+                            headers.insert(header_name, header_value);
                         }
-                    }
-
-                    let http_client = match reqwest::Client::builder()
-                        .default_headers(headers)
-                        .build() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            let error = format!(r#"{{"error": "Failed to create HTTP client: {}"}}"#, e);
+                        _ => {
+                            // The value is left out of the message: it may be a
+                            // credential, and this string is returned to SQL
+                            let error = format!(r#"{{"error": "Invalid value for header {}"}}"#, key);
                             return (error, None);
                         }
-                    };
-
-                    StreamableHttpClientTransport::with_client(http_client, config)
-                } else {
-                    StreamableHttpClientTransport::from_config(config)
+                    }
                 }
+
+                let http_client = match reqwest::Client::builder()
+                    .default_headers(headers)
+                    .build() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let error = format!(r#"{{"error": "Failed to create HTTP client: {}"}}"#, e);
+                        return (error, None);
+                    }
+                };
+
+                StreamableHttpClientTransport::with_client(http_client, config)
             } else {
                 // No custom headers
                 StreamableHttpClientTransport::from_config(config)
@@ -563,9 +637,14 @@ pub extern "C" fn mcp_connect(
         });
         *new_client.server_url.lock().unwrap() = Some(url);
 
-        // Store the client globally
-        let global_client = GLOBAL_CLIENT.get_or_init(|| Mutex::new(None));
-        *global_client.lock().unwrap() = Some(new_client);
+        // Bind the client to this SQLite connection, replacing whatever session
+        // that connection had before. The old client is dropped after the
+        // registry lock is released.
+        let previous = match clients().lock() {
+            Ok(mut map) => map.insert(db as usize, Arc::new(new_client)),
+            Err(_) => None,
+        };
+        drop(previous);
     }
 
     // Parse the JSON response using serde_json to check status
@@ -603,36 +682,29 @@ pub extern "C" fn mcp_connect(
     }
 }
 
-/// Disconnect from MCP server and reset global client state
+/// Disconnect one SQLite connection from its MCP server
 /// Returns NULL on success
 #[no_mangle]
-pub extern "C" fn mcp_disconnect() -> *mut c_char {
-    let global_client = GLOBAL_CLIENT.get_or_init(|| Mutex::new(None));
-    *global_client.lock().unwrap() = None;
-    
-    // Also clear any active stream channels
-    {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            let mut channels = STREAM_CHANNELS.lock().await;
-            channels.clear();
-        });
-    }
-    
-    // Reset stream counter
-    *STREAM_COUNTER.lock().unwrap() = 0;
-    
+pub extern "C" fn mcp_disconnect(db: *mut c_void) -> *mut c_char {
+    // Dropping the client closes the session and discards its streams, so no
+    // separate runtime is needed to clear them any more.
+    forget_client(db);
     ptr::null_mut()
+}
+
+/// Release everything bound to a SQLite connection that is going away.
+/// Registered as the destructor of an application-defined function, so SQLite
+/// calls it when the connection is closed.
+#[no_mangle]
+pub extern "C" fn mcp_conn_close(db: *mut c_void) {
+    forget_client(db);
 }
 
 /// List tools available on the connected MCP server (returns raw JSON)
 /// Returns: JSON string with tools list (must be freed with mcp_free_string)
 #[no_mangle]
-pub extern "C" fn mcp_list_tools_json(_client_ptr: *mut McpClient) -> *mut c_char {
-    // Get global client
-    let global_client_guard = GLOBAL_CLIENT.get()
-        .and_then(|c| Some(c.lock().unwrap()));
-    let client = match global_client_guard.as_ref().and_then(|g| g.as_ref()) {
+pub extern "C" fn mcp_list_tools_json(db: *mut c_void) -> *mut c_char {
+    let client = match client_for(db) {
         Some(c) => c,
         None => {
             let error = r#"{"error": "Not connected. Call mcp_connect() first"}"#;
@@ -686,7 +758,7 @@ pub extern "C" fn mcp_list_tools_json(_client_ptr: *mut McpClient) -> *mut c_cha
 /// Returns: JSON string with tool result (must be freed with mcp_free_string)
 #[no_mangle]
 pub extern "C" fn mcp_call_tool_json(
-    _client_ptr: *mut McpClient,
+    db: *mut c_void,
     tool_name: *const c_char,
     arguments_json: *const c_char,
 ) -> *mut c_char {
@@ -723,10 +795,7 @@ pub extern "C" fn mcp_call_tool_json(
         }
     };
 
-    // Get global client
-    let global_client_guard = GLOBAL_CLIENT.get()
-        .and_then(|c| Some(c.lock().unwrap()));
-    let client = match global_client_guard.as_ref().and_then(|g| g.as_ref()) {
+    let client = match client_for(db) {
         Some(c) => c,
         None => {
             let error = r#"{"error": "Not connected. Call mcp_connect() first"}"#;
@@ -772,16 +841,10 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::Mutex as TokioMutex;
 
-lazy_static::lazy_static! {
-    static ref STREAM_CHANNELS: Arc<TokioMutex<HashMap<usize, tokio::sync::mpsc::UnboundedReceiver<StreamChunk>>>> =
-        Arc::new(TokioMutex::new(HashMap::new()));
-    static ref STREAM_COUNTER: Mutex<usize> = Mutex::new(0);
-}
-
 // FFI-compatible StreamResult struct (must match C definition)
 #[repr(C)]
 pub struct StreamResult {
-    pub result_type: i32,  // 0=tool, 1=text, 2=error, 3=done
+    pub result_type: i32,  // 0=tool, 1=text, 2=error, 3=done, 4=timeout
     pub data: *mut c_char,
 }
 
@@ -790,6 +853,7 @@ const STREAM_TYPE_TOOL: i32 = 0;
 const STREAM_TYPE_TEXT: i32 = 1;
 const STREAM_TYPE_ERROR: i32 = 2;
 const STREAM_TYPE_DONE: i32 = 3;
+const STREAM_TYPE_TIMEOUT: i32 = 4;
 
 // Internal stream chunk enum
 #[derive(Debug, Clone)]
@@ -800,78 +864,70 @@ enum StreamChunk {
     Done,
 }
 
-/// Initialize a new list_tools stream
-/// Returns a stream ID that can be used to fetch results
+/// Initialize a new list_tools stream on a SQLite connection's client
+/// Returns a stream ID that can be used to fetch results, or 0 if that
+/// connection has no session (call mcp_connect() first)
 #[no_mangle]
-pub extern "C" fn mcp_list_tools_init() -> usize {
-    // Get next stream ID
-    let stream_id = {
-        let mut counter = STREAM_COUNTER.lock().unwrap();
-        *counter += 1;
-        *counter
+pub extern "C" fn mcp_list_tools_init(db: *mut c_void) -> usize {
+    // Without a client there is nowhere to register the receiver, so the error
+    // chunk would be dropped together with it and the caller would see an empty
+    // stream instead of a failure: report the missing session as a 0 stream id.
+    let client = match client_for(db) {
+        Some(c) => c,
+        None => return 0,
     };
+
+    let stream_id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
 
     // Create unbounded channel for streaming
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-    // Get the global client
-    let client_mutex = GLOBAL_CLIENT.get_or_init(|| Mutex::new(None));
+    // Clone the Arc to share the service across async boundaries
+    let service_arc = client.service.clone();
 
-    // Spawn the async task
-    {
-        let client_opt = client_mutex.lock().unwrap();
-        if let Some(client) = client_opt.as_ref() {
-            // Clone the Arc to share the service across async boundaries
-            let service_arc = client.service.clone();
-
-            // Use the client's runtime to spawn the task
-            client.runtime.spawn(async move {
-                let service_guard = service_arc.lock().await;
-                if let Some(service) = service_guard.as_ref() {
-                    match service.list_tools(None).await {
-                        Ok(response) => {
-                            // Send each tool as a separate chunk
-                            for tool in response.tools {
-                                if let Ok(tool_json) = serde_json::to_value(&tool) {
-                                    let _ = tx.send(StreamChunk::Tool(tool_json));
-                                }
-                            }
-                            let _ = tx.send(StreamChunk::Done);
-                        }
-                        Err(e) => {
-                            let _ = tx.send(StreamChunk::Error(format!("Failed to list tools: {}", e)));
-                            let _ = tx.send(StreamChunk::Done);
+    // Use the client's runtime to spawn the task
+    client.runtime.spawn(async move {
+        let service_guard = service_arc.lock().await;
+        if let Some(service) = service_guard.as_ref() {
+            match service.list_tools(None).await {
+                Ok(response) => {
+                    // Send each tool as a separate chunk
+                    for tool in response.tools {
+                        if let Ok(tool_json) = serde_json::to_value(&tool) {
+                            let _ = tx.send(StreamChunk::Tool(tool_json));
                         }
                     }
-                } else {
-                    // No service connected
-                    let _ = tx.send(StreamChunk::Error("Not connected. Call mcp_connect() first".to_string()));
                     let _ = tx.send(StreamChunk::Done);
                 }
-            });
+                Err(e) => {
+                    let _ = tx.send(StreamChunk::Error(format!("Failed to list tools: {}", e)));
+                    let _ = tx.send(StreamChunk::Done);
+                }
+            }
         } else {
-            // No client initialized
-            let _ = tx.send(StreamChunk::Error("Client not initialized".to_string()));
+            // No service connected
+            let _ = tx.send(StreamChunk::Error("Not connected. Call mcp_connect() first".to_string()));
             let _ = tx.send(StreamChunk::Done);
         }
-    } // Release the lock here
+    });
 
-    // Store the receiver in global storage (now safe to acquire lock again)
-    let client_opt = client_mutex.lock().unwrap();
-    if let Some(client) = client_opt.as_ref() {
-        client.runtime.block_on(async {
-            let mut channels = STREAM_CHANNELS.lock().await;
-            channels.insert(stream_id, rx);
-        });
-    }
+    // Store the receiver on this connection's client
+    client.runtime.block_on(async {
+        client.streams.lock().await.insert(stream_id, rx);
+    });
 
     stream_id
 }
 
 /// Initialize a stream for calling a tool and retrieving results
-/// Returns a stream ID that can be used with mcp_stream_next/wait/cleanup
+/// Returns a stream ID that can be used with mcp_stream_next/wait/cleanup, or 0
+/// on invalid arguments or if this connection has no session
 #[no_mangle]
-pub extern "C" fn mcp_call_tool_init(tool_name: *const c_char, arguments: *const c_char) -> usize {
+pub extern "C" fn mcp_call_tool_init(
+    db: *mut c_void,
+    tool_name: *const c_char,
+    arguments: *const c_char,
+) -> usize {
     let tool_name_str = unsafe {
         if tool_name.is_null() {
             return 0;
@@ -892,88 +948,83 @@ pub extern "C" fn mcp_call_tool_init(tool_name: *const c_char, arguments: *const
         }
     };
 
-    // Generate unique stream ID
-    let stream_id = {
-        let mut counter = STREAM_COUNTER.lock().unwrap();
-        *counter += 1;
-        *counter
+    // Without a client the receiver could not be registered and the error chunk
+    // would be lost with it, so report the missing session as a 0 stream id
+    // rather than as an empty stream.
+    let client = match client_for(db) {
+        Some(c) => c,
+        None => return 0,
     };
+
+    let stream_id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
 
     // Create unbounded channel for streaming
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-    // Get the global client
-    let client_mutex = GLOBAL_CLIENT.get_or_init(|| Mutex::new(None));
+    let service_arc = client.service.clone();
 
-    // Spawn the async task
-    {
-        let client_opt = client_mutex.lock().unwrap();
-        if let Some(client) = client_opt.as_ref() {
-            let service_arc = client.service.clone();
+    // Use the client's runtime to spawn the task
+    client.runtime.spawn(async move {
+        let service_guard = service_arc.lock().await;
+        if let Some(service) = service_guard.as_ref() {
+            // Parse arguments
+            let arguments_json: serde_json::Value = match serde_json::from_str(&arguments_str) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx.send(StreamChunk::Error(format!("Invalid JSON arguments: {}", e)));
+                    let _ = tx.send(StreamChunk::Done);
+                    return;
+                }
+            };
 
-            // Use the client's runtime to spawn the task
-            client.runtime.spawn(async move {
-                let service_guard = service_arc.lock().await;
-                if let Some(service) = service_guard.as_ref() {
-                    // Parse arguments
-                    let arguments_json: serde_json::Value = match serde_json::from_str(&arguments_str) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let _ = tx.send(StreamChunk::Error(format!("Invalid JSON arguments: {}", e)));
+            // Create the call tool parameter
+            let call_param = rmcp::model::CallToolRequestParam {
+                name: std::borrow::Cow::Owned(tool_name_str),
+                arguments: arguments_json.as_object().cloned(),
+            };
+
+            // Call the tool
+            match service.call_tool(call_param).await {
+                Ok(result) => {
+                    // Serialize the result to JSON and extract text content
+                    if let Ok(result_json) = serde_json::to_value(&result) {
+                        // A tool that fails at the application level sets isError
+                        // and describes the failure in its content: report that as
+                        // an error, not as rows that look like a successful result
+                        if result.is_error == Some(true) {
+                            let _ = tx.send(StreamChunk::Error(tool_error_message(&result_json)));
                             let _ = tx.send(StreamChunk::Done);
                             return;
                         }
-                    };
-
-                    // Create the call tool parameter
-                    let call_param = rmcp::model::CallToolRequestParam {
-                        name: std::borrow::Cow::Owned(tool_name_str),
-                        arguments: arguments_json.as_object().cloned(),
-                    };
-
-                    // Call the tool
-                    match service.call_tool(call_param).await {
-                        Ok(result) => {
-                            // Serialize the result to JSON and extract text content
-                            if let Ok(result_json) = serde_json::to_value(&result) {
-                                if let Some(content_array) = result_json.get("content").and_then(|v| v.as_array()) {
-                                    for item in content_array {
-                                        if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
-                                            if item_type == "text" {
-                                                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                                                    let _ = tx.send(StreamChunk::Text(text.to_string()));
-                                                }
-                                            }
+                        if let Some(content_array) = result_json.get("content").and_then(|v| v.as_array()) {
+                            for item in content_array {
+                                if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
+                                    if item_type == "text" {
+                                        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                                            let _ = tx.send(StreamChunk::Text(text.to_string()));
                                         }
                                     }
                                 }
                             }
-                            let _ = tx.send(StreamChunk::Done);
-                        }
-                        Err(e) => {
-                            let _ = tx.send(StreamChunk::Error(format!("Failed to call tool: {}", e)));
-                            let _ = tx.send(StreamChunk::Done);
                         }
                     }
-                } else {
-                    let _ = tx.send(StreamChunk::Error("Not connected. Call mcp_connect() first".to_string()));
                     let _ = tx.send(StreamChunk::Done);
                 }
-            });
+                Err(e) => {
+                    let _ = tx.send(StreamChunk::Error(format!("Failed to call tool: {}", e)));
+                    let _ = tx.send(StreamChunk::Done);
+                }
+            }
         } else {
-            let _ = tx.send(StreamChunk::Error("Client not initialized".to_string()));
+            let _ = tx.send(StreamChunk::Error("Not connected. Call mcp_connect() first".to_string()));
             let _ = tx.send(StreamChunk::Done);
         }
-    }
+    });
 
-    // Store the receiver
-    let client_opt = client_mutex.lock().unwrap();
-    if let Some(client) = client_opt.as_ref() {
-        client.runtime.block_on(async {
-            let mut channels = STREAM_CHANNELS.lock().await;
-            channels.insert(stream_id, rx);
-        });
-    }
+    // Store the receiver on this connection's client
+    client.runtime.block_on(async {
+        client.streams.lock().await.insert(stream_id, rx);
+    });
 
     stream_id
 }
@@ -981,69 +1032,76 @@ pub extern "C" fn mcp_call_tool_init(tool_name: *const c_char, arguments: *const
 /// Try to get the next chunk from a stream (non-blocking)
 /// Returns NULL if no data is available
 #[no_mangle]
-pub extern "C" fn mcp_stream_next(stream_id: usize) -> *mut StreamResult {
-    let client_mutex = GLOBAL_CLIENT.get_or_init(|| Mutex::new(None));
-    let client_opt = client_mutex.lock().unwrap();
+pub extern "C" fn mcp_stream_next(db: *mut c_void, stream_id: usize) -> *mut StreamResult {
+    let client = match client_for(db) {
+        Some(c) => c,
+        None => return ptr::null_mut(),
+    };
 
-    if let Some(client) = client_opt.as_ref() {
-        client.runtime.block_on(async {
-            let mut channels = STREAM_CHANNELS.lock().await;
-            if let Some(rx) = channels.get_mut(&stream_id) {
-                match rx.try_recv() {
-                    Ok(chunk) => {
-                        Box::into_raw(Box::new(chunk_to_stream_result(chunk)))
-                    }
-                    Err(_) => ptr::null_mut(),
-                }
-            } else {
-                ptr::null_mut()
+    client.runtime.block_on(async {
+        let mut streams = client.streams.lock().await;
+        if let Some(rx) = streams.get_mut(&stream_id) {
+            match rx.try_recv() {
+                Ok(chunk) => Box::into_raw(Box::new(chunk_to_stream_result(chunk))),
+                Err(_) => ptr::null_mut(),
             }
-        })
-    } else {
-        ptr::null_mut()
-    }
+        } else {
+            ptr::null_mut()
+        }
+    })
 }
 
 /// Wait for the next chunk from a stream (blocking with timeout)
 /// timeout_ms: Maximum milliseconds to wait
-/// Returns NULL if timeout occurs or stream is closed
+/// Returns a STREAM_TYPE_TIMEOUT result if the timeout elapses while the stream
+/// is still open, a STREAM_TYPE_DONE result if the stream is closed, or NULL if
+/// the stream id is unknown
 #[no_mangle]
-pub extern "C" fn mcp_stream_wait(stream_id: usize, timeout_ms: u64) -> *mut StreamResult {
-    let client_mutex = GLOBAL_CLIENT.get_or_init(|| Mutex::new(None));
-    let client_opt = client_mutex.lock().unwrap();
+pub extern "C" fn mcp_stream_wait(
+    db: *mut c_void,
+    stream_id: usize,
+    timeout_ms: u64,
+) -> *mut StreamResult {
+    let client = match client_for(db) {
+        Some(c) => c,
+        None => return ptr::null_mut(),
+    };
 
-    if let Some(client) = client_opt.as_ref() {
-        client.runtime.block_on(async {
-            let mut channels = STREAM_CHANNELS.lock().await;
-            if let Some(rx) = channels.get_mut(&stream_id) {
-                let timeout = tokio::time::Duration::from_millis(timeout_ms);
-                match tokio::time::timeout(timeout, rx.recv()).await {
-                    Ok(Some(chunk)) => {
-                        Box::into_raw(Box::new(chunk_to_stream_result(chunk)))
-                    }
-                    _ => ptr::null_mut(),
-                }
-            } else {
-                ptr::null_mut()
+    client.runtime.block_on(async {
+        let mut streams = client.streams.lock().await;
+        if let Some(rx) = streams.get_mut(&stream_id) {
+            let timeout = tokio::time::Duration::from_millis(timeout_ms);
+            match tokio::time::timeout(timeout, rx.recv()).await {
+                Ok(Some(chunk)) => Box::into_raw(Box::new(chunk_to_stream_result(chunk))),
+                // Sender dropped without a Done chunk: the stream is over
+                Ok(None) => Box::into_raw(Box::new(StreamResult {
+                    result_type: STREAM_TYPE_DONE,
+                    data: ptr::null_mut(),
+                })),
+                // The timeout elapsed but the stream is still open, so this
+                // must not be reported to the caller as the end of it
+                Err(_) => Box::into_raw(Box::new(StreamResult {
+                    result_type: STREAM_TYPE_TIMEOUT,
+                    data: ptr::null_mut(),
+                })),
             }
-        })
-    } else {
-        ptr::null_mut()
-    }
+        } else {
+            ptr::null_mut()
+        }
+    })
 }
 
 /// Clean up a stream and free its resources
 #[no_mangle]
-pub extern "C" fn mcp_stream_cleanup(stream_id: usize) {
-    let client_mutex = GLOBAL_CLIENT.get_or_init(|| Mutex::new(None));
-    let client_opt = client_mutex.lock().unwrap();
+pub extern "C" fn mcp_stream_cleanup(db: *mut c_void, stream_id: usize) {
+    let client = match client_for(db) {
+        Some(c) => c,
+        None => return,
+    };
 
-    if let Some(client) = client_opt.as_ref() {
-        client.runtime.block_on(async {
-            let mut channels = STREAM_CHANNELS.lock().await;
-            channels.remove(&stream_id);
-        });
-    }
+    client.runtime.block_on(async {
+        client.streams.lock().await.remove(&stream_id);
+    });
 }
 
 /// Free a StreamResult returned by mcp_stream_next or mcp_stream_wait

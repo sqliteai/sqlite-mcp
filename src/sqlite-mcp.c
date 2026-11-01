@@ -74,7 +74,8 @@ static void mcp_connect_func(
     legacy_sse = sqlite3_value_int(argv[2]);
   }
 
-  char *result = mcp_connect(NULL, server_url, headers_json, legacy_sse);
+  char *result = mcp_connect(sqlite3_context_db_handle(context), server_url,
+                             headers_json, legacy_sse);
 
   if (!result) {
     // NULL result means success
@@ -97,7 +98,7 @@ static void mcp_disconnect_func(
     return;
   }
 
-  char *result = mcp_disconnect();
+  char *result = mcp_disconnect(sqlite3_context_db_handle(context));
   
   // Should always return NULL (success)
   if (!result) {
@@ -120,24 +121,62 @@ typedef struct StreamResult {
 } StreamResult;
 
 // Stream type constants (must match Rust)
-#define STREAM_TYPE_TOOL  0
-#define STREAM_TYPE_TEXT  1
-#define STREAM_TYPE_ERROR 2
-#define STREAM_TYPE_DONE  3
+#define STREAM_TYPE_TOOL    0
+#define STREAM_TYPE_TEXT    1
+#define STREAM_TYPE_ERROR   2
+#define STREAM_TYPE_DONE    3
+#define STREAM_TYPE_TIMEOUT 4
 
-// Rust FFI streaming functions
-extern size_t mcp_list_tools_init(void);
-extern size_t mcp_call_tool_init(const char* tool_name, const char* arguments);
-extern StreamResult* mcp_stream_next(size_t stream_id);
-extern StreamResult* mcp_stream_wait(size_t stream_id, uint64_t timeout_ms);
-extern void mcp_stream_cleanup(size_t stream_id);
+// Longest time to wait for a chunk before giving up on the MCP server.
+// The wait is sliced so that a single call never blocks the Rust side (and
+// therefore every other open stream) for the whole budget at once.
+#define MCP_STREAM_TIMEOUT_MS 60000
+#define MCP_STREAM_SLICE_MS   500
+
+// Rust FFI streaming functions. The first argument is the SQLite connection
+// the session belongs to: every session is bound to one connection, so another
+// connection in the same process cannot reach it.
+extern size_t mcp_list_tools_init(sqlite3* db);
+extern size_t mcp_call_tool_init(sqlite3* db, const char* tool_name, const char* arguments);
+extern StreamResult* mcp_stream_next(sqlite3* db, size_t stream_id);
+extern StreamResult* mcp_stream_wait(sqlite3* db, size_t stream_id, uint64_t timeout_ms);
+extern void mcp_stream_cleanup(sqlite3* db, size_t stream_id);
 extern void mcp_stream_free_result(StreamResult* result);
 
+/*
+** Wait up to total_ms for the next chunk of a stream.
+**
+** mcp_stream_wait() reports an elapsed timeout as STREAM_TYPE_TIMEOUT, which is
+** NOT the end of the stream: keep waiting until the budget is exhausted, and
+** hand the timeout back to the caller so that it can be reported as an error
+** instead of being mistaken for an empty result set.
+**
+** Returns NULL only when the stream itself is gone.
+*/
+static StreamResult *mcp_stream_wait_total(sqlite3 *db, size_t stream_id, uint64_t total_ms) {
+  uint64_t waited = 0;
+
+  for (;;) {
+    uint64_t remaining = total_ms - waited;
+    uint64_t slice = remaining < MCP_STREAM_SLICE_MS ? remaining : MCP_STREAM_SLICE_MS;
+
+    StreamResult *result = mcp_stream_wait(db, stream_id, slice);
+    if (!result) return NULL;
+    if (result->result_type != STREAM_TYPE_TIMEOUT) return result;
+
+    waited += slice;
+    if (waited >= total_ms) return result;  /* caller reports the timeout */
+
+    mcp_stream_free_result(result);
+  }
+}
+
 // Rust FFI JSON functions
-extern char* mcp_list_tools_json(void*);
-extern char* mcp_call_tool_json(void*, const char*, const char*);
+extern char* mcp_list_tools_json(sqlite3* db);
+extern char* mcp_call_tool_json(sqlite3* db, const char*, const char*);
 extern void mcp_free_string(char*);
 extern char* mcp_extract_error_message(const char*);
+extern char* mcp_extract_tool_error(const char*);
 
 // JSON parsing functions (using serde_json in Rust)
 extern size_t mcp_parse_tools_json(const char* json_str);
@@ -147,6 +186,7 @@ extern char* mcp_get_call_result_text(const char* json_str, size_t content_index
 
 typedef struct mcp_stream_vtab {
   sqlite3_vtab base;
+  sqlite3 *db;                /* connection this table belongs to */
 } mcp_stream_vtab;
 
 typedef struct mcp_stream_cursor {
@@ -171,7 +211,13 @@ static int mcp_stream_connect(
   mcp_stream_vtab *pNew = sqlite3_malloc(sizeof(*pNew));
   if (pNew==0) return SQLITE_NOMEM;
   memset(pNew, 0, sizeof(*pNew));
+  pNew->db = db;
   *ppVtab = (sqlite3_vtab*)pNew;
+
+  // These functions reach the network and run remote tools, so keep them out
+  // of views and triggers: a database whose schema was modified by someone
+  // else must not be able to invoke them from an ordinary query
+  sqlite3_vtab_config(db, SQLITE_VTAB_DIRECTONLY);
 
   int rc = sqlite3_declare_vtab(db,
     "CREATE TABLE x(name TEXT, title TEXT, description TEXT, "
@@ -198,7 +244,7 @@ static int mcp_stream_close(sqlite3_vtab_cursor *cur){
 
   // Cleanup stream resources
   if (pCur->stream_id > 0) {
-    mcp_stream_cleanup(pCur->stream_id);
+    mcp_stream_cleanup(((mcp_stream_vtab*)cur->pVtab)->db, pCur->stream_id);
   }
 
   if (pCur->current_data) {
@@ -219,11 +265,13 @@ static int mcp_stream_filter(
   D("mcp_stream_filter: Starting mcp_list_tools streaming");
 
   // Initialize streaming
-  pCur->stream_id = mcp_list_tools_init();
+  pCur->stream_id = mcp_list_tools_init(((mcp_stream_vtab*)pVtabCursor->pVtab)->db);
   DF("mcp_stream_filter: stream_id=%zu", pCur->stream_id);
 
   if (pCur->stream_id == 0) {
     D("mcp_stream_filter: Failed to initialize stream (stream_id=0)");
+    pCur->base.pVtab->zErrMsg = sqlite3_mprintf(
+      "Not connected. Call mcp_connect() first");
     pCur->eof = 1;
     return SQLITE_ERROR;
   }
@@ -247,14 +295,17 @@ static int mcp_stream_next_impl(sqlite3_vtab_cursor *cur) {
     pCur->current_data = NULL;
   }
 
-  // Poll for next chunk (with 100ms wait if needed)
+  // Wait for the next chunk
   D("mcp_stream_next_impl: Waiting for next stream result...");
-  StreamResult *result = mcp_stream_wait(pCur->stream_id, 100);
+  StreamResult *result = mcp_stream_wait_total(
+    ((mcp_stream_vtab*)cur->pVtab)->db, pCur->stream_id, MCP_STREAM_TIMEOUT_MS);
 
   if (!result) {
-    D("mcp_stream_next_impl: No result received (NULL)");
+    D("mcp_stream_next_impl: Stream is gone (NULL)");
+    pCur->base.pVtab->zErrMsg = sqlite3_mprintf(
+      "mcp_list_tools: the stream is no longer available");
     pCur->eof = 1;
-    return SQLITE_OK;
+    return SQLITE_ERROR;
   }
 
   DF("mcp_stream_next_impl: Received result_type=%d", result->result_type);
@@ -292,6 +343,16 @@ static int mcp_stream_next_impl(sqlite3_vtab_cursor *cur) {
       mcp_stream_free_result(result);
       return SQLITE_ERROR;
 
+    case STREAM_TYPE_TIMEOUT:
+      // The server never answered: report it instead of returning no rows
+      D("mcp_stream_next_impl: STREAM_TYPE_TIMEOUT - giving up");
+      pCur->base.pVtab->zErrMsg = sqlite3_mprintf(
+        "mcp_list_tools: timed out after %d ms waiting for the MCP server",
+        (int)MCP_STREAM_TIMEOUT_MS);
+      pCur->eof = 1;
+      mcp_stream_free_result(result);
+      return SQLITE_ERROR;
+
     case STREAM_TYPE_DONE:
       // Stream complete
       D("mcp_stream_next_impl: STREAM_TYPE_DONE - stream complete");
@@ -300,8 +361,11 @@ static int mcp_stream_next_impl(sqlite3_vtab_cursor *cur) {
 
     default:
       DF("mcp_stream_next_impl: Unknown result_type=%d", result->result_type);
+      pCur->base.pVtab->zErrMsg = sqlite3_mprintf(
+        "mcp_list_tools: unexpected stream result type %d", result->result_type);
       pCur->eof = 1;
-      break;
+      mcp_stream_free_result(result);
+      return SQLITE_ERROR;
   }
 
   mcp_stream_free_result(result);
@@ -403,6 +467,7 @@ static sqlite3_module mcp_stream_module = {
 */
 typedef struct mcp_call_tool_stream_vtab {
   sqlite3_vtab base;
+  sqlite3 *db;                /* connection this table belongs to */
 } mcp_call_tool_stream_vtab;
 
 typedef struct mcp_call_tool_stream_cursor {
@@ -423,6 +488,7 @@ static int mcp_call_tool_stream_connect(
   mcp_call_tool_stream_vtab *pNew = sqlite3_malloc(sizeof(*pNew));
   if (pNew==0) return SQLITE_NOMEM;
   memset(pNew, 0, sizeof(*pNew));
+  pNew->db = db;
 
   DF("mcp_call_tool_stream_connect: argc=%d", argc);
   for (int i = 0; i < argc; i++) {
@@ -430,6 +496,11 @@ static int mcp_call_tool_stream_connect(
   }
 
   *ppVtab = (sqlite3_vtab*)pNew;
+
+  // These functions reach the network and run remote tools, so keep them out
+  // of views and triggers: a database whose schema was modified by someone
+  // else must not be able to invoke them from an ordinary query
+  sqlite3_vtab_config(db, SQLITE_VTAB_DIRECTONLY);
 
   int rc = sqlite3_declare_vtab(db, "CREATE TABLE x(text TEXT, tool_name HIDDEN, arguments HIDDEN)");
   return rc;
@@ -453,7 +524,7 @@ static int mcp_call_tool_stream_close(sqlite3_vtab_cursor *cur){
   mcp_call_tool_stream_cursor *pCur = (mcp_call_tool_stream_cursor*)cur;
 
   if (pCur->stream_id > 0) {
-    mcp_stream_cleanup(pCur->stream_id);
+    mcp_stream_cleanup(((mcp_call_tool_stream_vtab*)cur->pVtab)->db, pCur->stream_id);
   }
 
   if (pCur->current_text) {
@@ -462,6 +533,85 @@ static int mcp_call_tool_stream_close(sqlite3_vtab_cursor *cur){
 
   sqlite3_free(pCur);
   return SQLITE_OK;
+}
+
+/*
+** Fetch the next chunk of a mcp_call_tool stream into the cursor.
+**
+** Shared by xFilter and xNext so that errors and timeouts are handled the same
+** way wherever the chunk arrives.
+*/
+static int mcp_call_tool_stream_fetch(sqlite3_vtab_cursor *cur){
+  mcp_call_tool_stream_cursor *pCur = (mcp_call_tool_stream_cursor*)cur;
+
+  if (pCur->current_text) {
+    sqlite3_free(pCur->current_text);
+    pCur->current_text = NULL;
+  }
+
+  StreamResult *result = mcp_stream_wait_total(
+    ((mcp_call_tool_stream_vtab*)cur->pVtab)->db, pCur->stream_id, MCP_STREAM_TIMEOUT_MS);
+  if (!result) {
+    D("mcp_call_tool_stream_fetch: Stream is gone (NULL)");
+    pCur->base.pVtab->zErrMsg = sqlite3_mprintf(
+      "mcp_call_tool: the stream is no longer available");
+    pCur->eof = 1;
+    return SQLITE_ERROR;
+  }
+
+  int rc = SQLITE_OK;
+
+  switch (result->result_type) {
+    case STREAM_TYPE_TEXT:
+      if (result->data) {
+        pCur->current_text = sqlite3_mprintf("%s", result->data);
+        pCur->rowid++;
+        DF("mcp_call_tool_stream_fetch: Got text chunk (%d bytes)", (int)strlen(result->data));
+      }
+      break;
+
+    case STREAM_TYPE_ERROR: {
+      DF("mcp_call_tool_stream_fetch: STREAM_TYPE_ERROR - %s", result->data ? result->data : "unknown error");
+      if (result->data) {
+        char *error_msg = mcp_extract_error_message(result->data);
+        if (error_msg) {
+          pCur->base.pVtab->zErrMsg = sqlite3_mprintf("%s", error_msg);
+          mcp_free_string(error_msg);
+        } else {
+          // If not JSON error format, use the data directly
+          pCur->base.pVtab->zErrMsg = sqlite3_mprintf("%s", result->data);
+        }
+      }
+      pCur->eof = 1;
+      rc = SQLITE_ERROR;
+      break;
+    }
+
+    case STREAM_TYPE_TIMEOUT:
+      D("mcp_call_tool_stream_fetch: STREAM_TYPE_TIMEOUT - giving up");
+      pCur->base.pVtab->zErrMsg = sqlite3_mprintf(
+        "mcp_call_tool: timed out after %d ms waiting for the MCP server",
+        (int)MCP_STREAM_TIMEOUT_MS);
+      pCur->eof = 1;
+      rc = SQLITE_ERROR;
+      break;
+
+    case STREAM_TYPE_DONE:
+      D("mcp_call_tool_stream_fetch: STREAM_TYPE_DONE - stream complete");
+      pCur->eof = 1;
+      break;
+
+    default:
+      DF("mcp_call_tool_stream_fetch: Unknown result_type=%d", result->result_type);
+      pCur->base.pVtab->zErrMsg = sqlite3_mprintf(
+        "mcp_call_tool: unexpected stream result type %d", result->result_type);
+      pCur->eof = 1;
+      rc = SQLITE_ERROR;
+      break;
+  }
+
+  mcp_stream_free_result(result);
+  return rc;
 }
 
 static int mcp_call_tool_stream_filter(
@@ -479,6 +629,8 @@ static int mcp_call_tool_stream_filter(
 
   if (idxNum == 0) {
     D("mcp_call_tool_stream_filter: Invalid query plan (idxNum=0)");
+    pCur->base.pVtab->zErrMsg = sqlite3_mprintf(
+      "mcp_call_tool requires a tool name and a JSON arguments string");
     pCur->eof = 1;
     return SQLITE_ERROR;
   }
@@ -492,12 +644,16 @@ static int mcp_call_tool_stream_filter(
     arguments = (const char*)sqlite3_value_text(argv[1]);
   } else {
     D("mcp_call_tool_stream_filter: Not enough arguments");
+    pCur->base.pVtab->zErrMsg = sqlite3_mprintf(
+      "mcp_call_tool requires a tool name and a JSON arguments string");
     pCur->eof = 1;
     return SQLITE_ERROR;
   }
 
   if (!tool_name || !arguments) {
     D("mcp_call_tool_stream_filter: tool_name or arguments is NULL");
+    pCur->base.pVtab->zErrMsg = sqlite3_mprintf(
+      "mcp_call_tool: tool name and arguments must not be NULL");
     pCur->eof = 1;
     return SQLITE_ERROR;
   }
@@ -505,10 +661,13 @@ static int mcp_call_tool_stream_filter(
   DF("mcp_call_tool_stream_filter: tool_name='%s', arguments='%s'", tool_name, arguments);
 
   // Initialize streaming
-  pCur->stream_id = mcp_call_tool_init(tool_name, arguments);
+  pCur->stream_id = mcp_call_tool_init(
+    ((mcp_call_tool_stream_vtab*)pVtabCursor->pVtab)->db, tool_name, arguments);
   DF("mcp_call_tool_stream_filter: stream_id=%d", (int)pCur->stream_id);
   if (pCur->stream_id == 0) {
     D("mcp_call_tool_stream_filter: stream_id is 0, failed");
+    pCur->base.pVtab->zErrMsg = sqlite3_mprintf(
+      "Not connected. Call mcp_connect() first");
     pCur->eof = 1;
     return SQLITE_ERROR;
   }
@@ -516,76 +675,13 @@ static int mcp_call_tool_stream_filter(
   pCur->rowid = 0;
   pCur->eof = 0;
 
-  // Get first result - use longer timeout for tool execution
-  StreamResult *result = mcp_stream_wait(pCur->stream_id, 5000); // 5 seconds timeout
-  if (!result) {
-    D("mcp_call_tool_stream_filter: No initial result");
-    pCur->eof = 1;
-    return SQLITE_OK;
-  }
-
-  if (result->result_type == STREAM_TYPE_DONE) {
-    D("mcp_call_tool_stream_filter: Stream immediately done");
-    pCur->eof = 1;
-    mcp_stream_free_result(result);
-    return SQLITE_OK;
-  }
-
-  if (result->result_type == STREAM_TYPE_TEXT && result->data) {
-    pCur->current_text = sqlite3_mprintf("%s", result->data);
-    pCur->rowid++;
-    DF("mcp_call_tool_stream_filter: Got first text chunk (%d bytes)", (int)strlen(result->data));
-  }
-
-  mcp_stream_free_result(result);
-  return SQLITE_OK;
+  // Get the first chunk through the same handling as xNext, so that an error
+  // or a timeout is not mistaken for an empty result set
+  return mcp_call_tool_stream_fetch(pVtabCursor);
 }
 
 static int mcp_call_tool_stream_next(sqlite3_vtab_cursor *cur){
-  mcp_call_tool_stream_cursor *pCur = (mcp_call_tool_stream_cursor*)cur;
-
-  if (pCur->current_text) {
-    sqlite3_free(pCur->current_text);
-    pCur->current_text = NULL;
-  }
-
-  StreamResult *result = mcp_stream_wait(pCur->stream_id, 1000); // 1 second timeout for subsequent results
-  if (!result) {
-    pCur->eof = 1;
-    return SQLITE_OK;
-  }
-
-  if (result->result_type == STREAM_TYPE_ERROR) {
-    // Stream error - stop iteration and set error message
-    DF("mcp_call_tool_stream_next: STREAM_TYPE_ERROR - %s", result->data ? result->data : "unknown error");
-    if (result->data) {
-      char *error_msg = mcp_extract_error_message(result->data);
-      if (error_msg) {
-        ((mcp_call_tool_stream_vtab*)pCur->base.pVtab)->base.zErrMsg = sqlite3_mprintf("%s", error_msg);
-        mcp_free_string(error_msg);
-      } else {
-        // If not JSON error format, use the data directly
-        ((mcp_call_tool_stream_vtab*)pCur->base.pVtab)->base.zErrMsg = sqlite3_mprintf("%s", result->data);
-      }
-    }
-    pCur->eof = 1;
-    mcp_stream_free_result(result);
-    return SQLITE_ERROR;
-  }
-
-  if (result->result_type == STREAM_TYPE_DONE) {
-    pCur->eof = 1;
-    mcp_stream_free_result(result);
-    return SQLITE_OK;
-  }
-
-  if (result->result_type == STREAM_TYPE_TEXT && result->data) {
-    pCur->current_text = sqlite3_mprintf("%s", result->data);
-    pCur->rowid++;
-  }
-
-  mcp_stream_free_result(result);
-  return SQLITE_OK;
+  return mcp_call_tool_stream_fetch(cur);
 }
 
 static int mcp_call_tool_stream_eof(sqlite3_vtab_cursor *cur){
@@ -725,6 +821,11 @@ static int mcp_tools_connect(
   pNew->table_created = 0;
   *ppVtab = (sqlite3_vtab*)pNew;
 
+  // These functions reach the network and run remote tools, so keep them out
+  // of views and triggers: a database whose schema was modified by someone
+  // else must not be able to invoke them from an ordinary query
+  sqlite3_vtab_config(db, SQLITE_VTAB_DIRECTONLY);
+
   return sqlite3_declare_vtab(db,
     "CREATE TABLE x(name TEXT, title TEXT, description TEXT, "
     "inputSchema TEXT, outputSchema TEXT, annotations TEXT)");
@@ -785,7 +886,7 @@ static int mcp_tools_filter(
   if (!pVtab->table_created) {
     D("mcp_tools_filter: Creating temp table");
     // Get tools list from MCP
-    char *result = mcp_list_tools_json(NULL);
+    char *result = mcp_list_tools_json(pVtab->db);
     if (!result) {
       D("mcp_tools_filter: mcp_list_tools_json returned NULL");
       pCur->eof = 1;
@@ -1022,6 +1123,11 @@ static int mcp_results_connect(
 
   *ppVtab = (sqlite3_vtab*)pNew;
 
+  // These functions reach the network and run remote tools, so keep them out
+  // of views and triggers: a database whose schema was modified by someone
+  // else must not be able to invoke them from an ordinary query
+  sqlite3_vtab_config(db, SQLITE_VTAB_DIRECTONLY);
+
   return sqlite3_declare_vtab(db, "CREATE TABLE x(text TEXT, tool_name HIDDEN, arguments HIDDEN)");
 }
 
@@ -1096,7 +1202,7 @@ static int mcp_results_filter(
   DF("  tool_name='%s', arguments='%s'", tool_name, arguments);
 
   // Call the tool - NO CACHING, fresh call every time
-  pCur->json_result = mcp_call_tool_json(NULL, tool_name, arguments);
+  pCur->json_result = mcp_call_tool_json(pVtab->db, tool_name, arguments);
   if (!pCur->json_result) {
     D("  Tool call failed");
     pCur->eof = 1;
@@ -1113,6 +1219,18 @@ static int mcp_results_filter(
     D("  JSON contains error");
     pVtab->base.zErrMsg = sqlite3_mprintf("%s", error_msg);
     mcp_free_string(error_msg);
+    pCur->eof = 1;
+    return SQLITE_ERROR;
+  }
+
+  // A tool that failed at the application level answers with isError and a
+  // result that otherwise looks successful: rows cannot express a failure, so
+  // report it as a SQL error rather than returning its content as data
+  char *tool_error = mcp_extract_tool_error(pCur->json_result);
+  if (tool_error) {
+    DF("  Tool reported a failure: %s", tool_error);
+    pVtab->base.zErrMsg = sqlite3_mprintf("%s", tool_error);
+    mcp_free_string(tool_error);
     pCur->eof = 1;
     return SQLITE_ERROR;
   }
@@ -1257,7 +1375,7 @@ static void mcp_tools_json_func(
   int argc,
   sqlite3_value **argv
 ){
-  char *result = mcp_list_tools_json(NULL);
+  char *result = mcp_list_tools_json(sqlite3_context_db_handle(context));
   if (result) {
     mcp_result_text(context, result, -1);
     mcp_free_string(result);
@@ -1284,13 +1402,23 @@ static void mcp_call_tool_json_func(
     return;
   }
 
-  char *result = mcp_call_tool_json(NULL, tool_name, arguments);
+  char *result = mcp_call_tool_json(sqlite3_context_db_handle(context), tool_name, arguments);
   if (result) {
     mcp_result_text(context, result, -1);
     mcp_free_string(result);
   } else {
     sqlite3_result_error(context, "Failed to call tool", -1);
   }
+}
+
+/*
+** Called by SQLite when a connection that loaded this extension goes away,
+** as the destructor of the mcp_connect() function. Releasing the session here
+** is what stops the registry from handing a later connection, which may reuse
+** the same handle address, a session it never opened.
+*/
+static void mcp_conn_destroy(void *pDb) {
+  mcp_conn_close((sqlite3*)pDb);
 }
 
 #ifdef _WIN32
@@ -1314,24 +1442,25 @@ int sqlite3_mcp_init(
                                0, mcp_version_func, 0, 0);
   if (rc != SQLITE_OK) return rc;
 
-  rc = sqlite3_create_function(db, "mcp_connect", -1,
-                               SQLITE_UTF8,
-                               0, mcp_connect_func, 0, 0);
+  rc = sqlite3_create_function_v2(db, "mcp_connect", -1,
+                                  SQLITE_UTF8 | SQLITE_DIRECTONLY,
+                                  db, mcp_connect_func, 0, 0,
+                                  mcp_conn_destroy);
   if (rc != SQLITE_OK) return rc;
 
   rc = sqlite3_create_function(db, "mcp_disconnect", 0,
-                               SQLITE_UTF8,
+                               SQLITE_UTF8 | SQLITE_DIRECTONLY,
                                0, mcp_disconnect_func, 0, 0);
   if (rc != SQLITE_OK) return rc;
 
   // Scalar functions that return JSON strings
   rc = sqlite3_create_function(db, "mcp_list_tools_json", 0,
-                               SQLITE_UTF8,
+                               SQLITE_UTF8 | SQLITE_DIRECTONLY,
                                0, mcp_tools_json_func, 0, 0);
   if (rc != SQLITE_OK) return rc;
 
   rc = sqlite3_create_function(db, "mcp_call_tool_json", 2,
-                               SQLITE_UTF8,
+                               SQLITE_UTF8 | SQLITE_DIRECTONLY,
                                0, mcp_call_tool_json_func, 0, 0);
   if (rc != SQLITE_OK) return rc;
 

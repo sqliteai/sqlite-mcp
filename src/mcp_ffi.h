@@ -14,9 +14,6 @@ extern "C" {
 
 #include <stdint.h>
 
-/* Opaque handle for MCP client */
-typedef struct McpClient McpClient;
-
 /**
  * Initialize the MCP library
  * Returns 0 on success, non-zero on error
@@ -29,31 +26,31 @@ int32_t mcp_init(void);
 void mcp_free_string(char* s);
 
 /**
- * Create a new MCP client
- * Returns NULL on error
- */
-McpClient* mcp_client_new(void);
-
-/**
- * Free an MCP client
- */
-void mcp_client_free(McpClient* client);
-
-/**
  * Connect to an MCP server with optional custom headers
- * client: MCP client pointer (can be NULL to use global client)
+ *
+ * Every session is bound to one SQLite connection: another connection in the
+ * same process cannot use it, and closing the connection releases it.
+ *
+ * db: the SQLite connection the session belongs to (sqlite3*)
  * server_url: URL of the MCP server (e.g., "http://localhost:8931/mcp")
  * headers_json: Optional JSON string with custom headers (e.g., "{\"Authorization\": \"Bearer token\", \"X-MCP-Readonly\": \"true\"}"), can be NULL
  * legacy_sse: 1 to use SSE transport (legacy), 0 to use streamable HTTP transport (default)
- * Returns: JSON string with status (must be freed with mcp_free_string)
+ * Returns: NULL on success, error string on failure (must be freed with mcp_free_string)
  */
-char* mcp_connect(McpClient* client, const char* server_url, const char* headers_json, int32_t legacy_sse);
+char* mcp_connect(void* db, const char* server_url, const char* headers_json, int32_t legacy_sse);
 
 /**
- * Disconnect from MCP server and reset global client state
+ * Disconnect one SQLite connection from its MCP server
  * Returns: NULL on success
  */
-char* mcp_disconnect(void);
+char* mcp_disconnect(void* db);
+
+/**
+ * Release everything bound to a SQLite connection that is going away.
+ * Registered as the destructor of an application-defined function, so SQLite
+ * calls it when the connection is closed.
+ */
+void mcp_conn_close(void* db);
 
 #ifdef __cplusplus
 }

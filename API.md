@@ -47,6 +47,13 @@ SELECT mcp_connect(server_url, headers_json, legacy_sse);
 - `NULL` on successful connection
 - Error message string on failure
 
+**Session scope:**
+
+A session belongs to the SQLite connection that opened it. Another connection in
+the same process cannot use it, even though both loaded the same extension, and
+closing the connection releases the session. `mcp_disconnect()` only ends the
+session of the connection it is called on.
+
 **Examples:**
 ```sql
 -- Connect using Streamable HTTP (default)
@@ -416,6 +423,31 @@ SELECT mcp_connect('http://localhost:8931/sse', NULL, 1);
 
 ---
 
+## Schema Restrictions
+
+`mcp_connect()`, `mcp_disconnect()`, `mcp_list_tools_json()`,
+`mcp_call_tool_json()` and the four virtual tables reach the network and run
+remote tools, so they can only be used from top-level SQL. They cannot appear in
+a VIEW, a TRIGGER, a CHECK constraint, a DEFAULT clause, a generated column or
+an index expression, and SQLite rejects such a statement with
+`unsafe use of ...`.
+
+This keeps a database file whose schema was modified by someone else from
+contacting a server, or running a tool, when an application merely queries it.
+Call these functions from your own statements instead, and store their results
+in an ordinary table if you need to query them later:
+
+```sql
+CREATE TABLE tools AS SELECT name, description FROM mcp_list_tools;
+```
+
+Use the streaming `mcp_list_tools` here, not `mcp_list_tools_respond`: the
+cached table populates itself through a nested statement, so it cannot be read
+from inside a statement that writes (`CREATE TABLE ... AS SELECT`,
+`INSERT ... SELECT`), which fails with `abort due to ROLLBACK`.
+
+---
+
 ## Error Handling
 
 The sqlite-mcp extension has consistent error handling across all interfaces:
@@ -436,6 +468,29 @@ SELECT mcp_connect('http://localhost:8000/mcp') IS NULL;
 -- Get error message if connection failed
 SELECT mcp_connect('http://invalid:8000/mcp');
 -- Returns: "Failed to connect to MCP server: ..."
+```
+
+### Tool Failures (`isError`)
+
+A tool can run and still refuse the request: MCP reports that with
+`isError: true` in the result, whose `content` describes the failure. This is
+different from a call that never got through, and the two are surfaced
+differently:
+
+- the virtual tables `mcp_call_tool` and `mcp_call_tool_respond` raise a SQL
+  error, because a row cannot express a failure. The message is the tool's own
+  text, prefixed with `Tool reported an error:`, as opposed to the
+  `Failed to call tool:` / `Tool call failed:` of a transport or protocol error
+- `mcp_call_tool_json()` returns the result as it came from the server, so the
+  `isError` flag and the content are both there for you to inspect
+
+```sql
+-- Raises: Tool reported an error: permission denied
+SELECT text FROM mcp_call_tool_respond('delete_file', '{"path": "/etc/passwd"}');
+
+-- Returns the raw result instead, isError included
+SELECT json_extract(mcp_call_tool_json('delete_file', '{"path": "/etc/passwd"}'),
+                    '$.result.isError');
 ```
 
 ### JSON Functions: mcp_list_tools_json() and mcp_call_tool_json()
