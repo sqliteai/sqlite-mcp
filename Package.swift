@@ -14,8 +14,8 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "mcpBinary",
-            url: "https://github.com/sqliteai/sqlite-mcp/releases/download/0.1.9/mcp-apple-xcframework-0.1.9.zip",
-            checksum: "bd78a37409d191f59b366a90f1c2cca83875ff9bc870cee121e66ccdc6bfc319"
+            url: "https://github.com/sqliteai/sqlite-mcp/releases/download/0.2.1/mcp-apple-xcframework-0.2.1.zip",
+            checksum: "4608d96f8d8bf0b8f56d472b195a0afa296b392114553b9f5f110492461bb1f6"
         ),
         .target(
             name: "mcp",
